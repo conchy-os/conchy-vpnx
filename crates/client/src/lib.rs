@@ -54,9 +54,14 @@ pub trait Vpnx {
     /// unlimited.
     #[zbus(property)]
     fn subscription(&self) -> zbus::Result<String>;
-    /// JSON list: `[{"url", "label", "updated_at", "error"}]`, in merge order.
+    /// JSON list: `[{"url", "label", "name", "source", "updated_at", "error"}]`,
+    /// in merge order. `name` is the file name, `source` the host or
+    /// "local file"; neither contains tokens from the URL.
     #[zbus(property)]
     fn overlays(&self) -> zbus::Result<String>;
+    /// The local `overlay.yaml`, merged last; it may not exist yet.
+    #[zbus(property)]
+    fn overlay_path(&self) -> zbus::Result<String>;
 }
 
 /// Root helper installed next to the binaries (`packaging/conchy-vpnx-tun`).

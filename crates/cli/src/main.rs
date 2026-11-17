@@ -81,6 +81,11 @@ enum OverlayCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Die quietly on a closed pipe (`conchy-vpnx status | head -1`) instead
+    // of panicking in println!.
+    // SAFETY: restoring the default disposition before any other thread uses
+    // signals.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse();
     let conn = zbus::Connection::session().await?;
     let vpnx = VpnxProxy::new(&conn).await?;

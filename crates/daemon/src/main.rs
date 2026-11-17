@@ -17,6 +17,8 @@ const DELAY_URL: &str = "https://www.gstatic.com/generate_204";
 struct Vpnx {
     engine: Arc<Mutex<Engine>>,
     status: watch::Receiver<Status>,
+    /// Fixed for the daemon's lifetime; read without the engine lock.
+    overlay_path: String,
 }
 
 fn failed(e: anyhow::Error) -> fdo::Error {
@@ -160,6 +162,11 @@ impl Vpnx {
     async fn overlays(&self) -> String {
         self.status.borrow().overlays.clone()
     }
+
+    #[zbus(property)]
+    async fn overlay_path(&self) -> String {
+        self.overlay_path.clone()
+    }
 }
 
 /// How often to check whether the subscription is due.
@@ -178,6 +185,7 @@ async fn main() -> Result<()> {
     let engine = Engine::new(paths, bus)?;
     engine.spawn_proc_watcher();
     let mut status = engine.status();
+    let overlay_path = engine.overlay_path();
     let engine = Arc::new(Mutex::new(engine));
 
     let conn = connection::Builder::session()?
@@ -187,6 +195,7 @@ async fn main() -> Result<()> {
             Vpnx {
                 engine: engine.clone(),
                 status: status.clone(),
+                overlay_path,
             },
         )?
         .build()

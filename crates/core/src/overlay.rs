@@ -38,6 +38,31 @@ pub fn label(url: &str) -> String {
     }
 }
 
+/// File name of the overlay, for lists.
+pub fn file_name(url: &str) -> String {
+    let path = match url.strip_prefix("file://") {
+        Some(p) => p.to_owned(),
+        None => reqwest::Url::parse(url)
+            .map(|u| u.path().to_owned())
+            .unwrap_or_default(),
+    };
+    path.rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("overlay")
+        .to_owned()
+}
+
+/// Where it comes from: the host, or "local file".
+pub fn source(url: &str) -> String {
+    if url.starts_with("file://") {
+        return "local file".to_owned();
+    }
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "?".to_owned())
+}
+
 /// Download `url` (or read `file://`), check it is an overlay and save it.
 pub async fn fetch(url: &str, dest: &Path) -> Result<()> {
     let text = if let Some(path) = url.strip_prefix("file://") {
@@ -91,6 +116,16 @@ mod tests {
             "raw.githubusercontent.com/…/overlay.yaml"
         );
         assert_eq!(label("file:///home/me/o.yaml"), "/home/me/o.yaml");
+    }
+
+    #[test]
+    fn name_and_source() {
+        let url = "https://raw.githubusercontent.com/me/rules/main/work.yaml?token=X";
+        assert_eq!(file_name(url), "work.yaml");
+        assert_eq!(source(url), "raw.githubusercontent.com");
+        assert_eq!(file_name("file:///home/me/rules/o.yaml"), "o.yaml");
+        assert_eq!(source("file:///home/me/rules/o.yaml"), "local file");
+        assert_eq!(file_name("https://example.com/"), "overlay");
     }
 
     #[test]

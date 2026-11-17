@@ -429,6 +429,8 @@ impl Engine {
                 json!({
                     "url": url,
                     "label": overlay::label(url),
+                    "name": overlay::file_name(url),
+                    "source": overlay::source(url),
                     "updated_at": updated_at,
                     "error": self.overlay_errors.get(url),
                 })
@@ -440,6 +442,11 @@ impl Engine {
             s.overlays = json;
             changed
         });
+    }
+
+    /// The user's local overlay, which may not exist yet.
+    pub fn overlay_path(&self) -> String {
+        self.paths.overlay().to_string_lossy().into_owned()
     }
 
     fn subscription_url(&self) -> Option<String> {
