@@ -1,0 +1,13 @@
+# pacman drops file capabilities when it replaces mihomo. If TUN access was
+# granted (`conchy-vpnx tun enable` or the shell's "Allow" button), restore
+# it; otherwise do nothing.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/bin/mihomo
+
+[Action]
+Description = Restoring mihomo TUN access for conchy-vpnx...
+When = PostTransaction
+Exec = /usr/bin/conchy-vpnx-tun reapply /usr/bin/mihomo

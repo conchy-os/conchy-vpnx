@@ -1,0 +1,41 @@
+# Arch / CachyOS, built from git.
+pkgname=conchy-vpnx-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Mihomo-based VPN client and daemon (D-Bus, CLI) from Conchy OS"
+arch=(x86_64 aarch64)
+url="https://github.com/conchy-os/conchy-vpnx"
+license=(GPL-3.0-or-later)
+depends=(mihomo dbus libcap gcc-libs glibc)
+makedepends=(cargo git)
+provides=(conchy-vpnx)
+conflicts=(conchy-vpnx)
+source=("git+${url}.git")
+sha256sums=(SKIP)
+
+pkgver() {
+  cd conchy-vpnx
+  printf "0.1.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd conchy-vpnx
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd conchy-vpnx
+  cargo build --frozen --release
+}
+
+check() {
+  cd conchy-vpnx
+  cargo test --frozen --workspace
+}
+
+package() {
+  cd conchy-vpnx
+  make DESTDIR="$pkgdir" PREFIX=/usr BINDIR=target/release install
+  install -Dm644 packaging/arch/conchy-vpnx-mihomo-caps.hook \
+    "$pkgdir/usr/share/libalpm/hooks/conchy-vpnx-mihomo-caps.hook"
+}

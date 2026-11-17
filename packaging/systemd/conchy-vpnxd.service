@@ -1,11 +1,14 @@
 [Unit]
 Description=conchy-vpnx daemon (mihomo supervisor)
-PartOf=graphical-session.target
-After=graphical-session.target
+Documentation=https://github.com/conchy-os/conchy-vpnx
 
 [Service]
+Type=dbus
+BusName=org.conchy.Vpnx
 ExecStart=/usr/bin/conchy-vpnxd
 Restart=on-failure
 
 [Install]
+# Optional: `systemctl --user enable conchy-vpnxd` starts it at login, which
+# matters only with `autoconnect true`. Otherwise D-Bus activation suffices.
 WantedBy=default.target

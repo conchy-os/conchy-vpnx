@@ -1,0 +1,9 @@
+# Upgrading replaces the binary and drops its capabilities. Restore TUN access
+# only if the administrator granted it (conchy-vpnx tun enable).
+case "${ACTION}" in
+post)
+	if [ -e etc/conchy-vpnx/tun-enabled ]; then
+		setcap cap_net_admin,cap_net_bind_service+ep usr/bin/mihomo || :
+	fi
+	;;
+esac

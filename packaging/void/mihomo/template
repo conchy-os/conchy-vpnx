@@ -1,0 +1,17 @@
+# Template file for 'mihomo'
+# Not in the official Void repositories. Copy to
+# conchy-packages/srcpkgs/mihomo, then `xgensum -i mihomo`.
+pkgname=mihomo
+version=1.19.34
+revision=1
+build_style=go
+go_import_path="github.com/metacubex/mihomo"
+go_build_tags="with_gvisor"
+go_ldflags="-X github.com/metacubex/mihomo/constant.Version=${version}"
+depends="libcap-progs"
+short_desc="Rule-based proxy kernel, formerly Clash.Meta"
+maintainer="Orphaned <orphan@voidlinux.org>"
+license="GPL-3.0-only"
+homepage="https://github.com/MetaCubeX/mihomo"
+distfiles="https://github.com/MetaCubeX/mihomo/archive/refs/tags/v${version}.tar.gz"
+checksum=@SHA256@

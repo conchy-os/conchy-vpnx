@@ -1,0 +1,6 @@
+# D-Bus activation: the daemon starts on first use (CLI, shell), with or
+# without systemd. Under systemd the unit below is used instead of Exec.
+[D-BUS Service]
+Name=org.conchy.Vpnx
+Exec=/usr/bin/conchy-vpnxd
+SystemdService=conchy-vpnxd.service

@@ -1,3 +1,5 @@
 #!/bin/sh
-# User service for runit's per-user runsvdir (~/service) or conchy-session.
+# Optional runit user service (Void: ~/service via runsvdir), for starting the
+# daemon at login with `autoconnect true`. D-Bus activation works without it.
+# The session bus address must be in the environment, e.g. from conchy-session.
 exec conchy-vpnxd 2>&1

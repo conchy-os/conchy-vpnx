@@ -1,0 +1,19 @@
+# Template file for 'conchy-vpnx'
+# Copy to conchy-packages/srcpkgs/conchy-vpnx, then `xgensum -i conchy-vpnx`.
+pkgname=conchy-vpnx
+version=0.1.0
+revision=1
+build_style=cargo
+depends="mihomo dbus libcap-progs"
+short_desc="Mihomo-based VPN client and daemon for Conchy OS"
+maintainer="Orphaned <orphan@voidlinux.org>"
+license="GPL-3.0-or-later"
+homepage="https://github.com/conchy-os/conchy-vpnx"
+distfiles="https://github.com/conchy-os/conchy-vpnx/archive/refs/tags/v${version}.tar.gz"
+checksum=@SHA256@
+
+do_install() {
+	make DESTDIR="${DESTDIR}" PREFIX=/usr \
+		BINDIR="target/${RUST_TARGET}/release" install
+	vlicense LICENSE
+}

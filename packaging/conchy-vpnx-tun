@@ -1,0 +1,36 @@
+#!/bin/sh
+# Grant or revoke mihomo's TUN capability. Runs as root, usually via pkexec
+# from `conchy-vpnx tun enable` or conchy-shell.
+#
+# The marker records that the administrator opted in, so package hooks can
+# re-apply the capability after mihomo upgrades (replacing the file drops it).
+set -eu
+
+MARKER=/etc/conchy-vpnx/tun-enabled
+CAPS=cap_net_admin,cap_net_bind_service+ep
+
+die() { echo "conchy-vpnx-tun: $*" >&2; exit 1; }
+
+[ $# -eq 2 ] || { echo "usage: conchy-vpnx-tun enable|disable|reapply /path/to/mihomo" >&2; exit 2; }
+op=$1 bin=$2
+
+case $bin in /*) ;; *) die "need an absolute path: $bin" ;; esac
+# Only ever touch a mihomo binary, never an arbitrary file.
+case ${bin##*/} in mihomo*) ;; *) die "not a mihomo binary: $bin" ;; esac
+
+case $op in
+enable)
+	[ -f "$bin" ] || die "no such file: $bin"
+	setcap "$CAPS" "$bin"
+	mkdir -p "${MARKER%/*}"
+	: >"$MARKER"
+	;;
+disable)
+	[ -f "$bin" ] && setcap -r "$bin" 2>/dev/null || :
+	rm -f "$MARKER"
+	;;
+reapply)
+	[ -e "$MARKER" ] && [ -f "$bin" ] && setcap "$CAPS" "$bin" || :
+	;;
+*) die "unknown command: $op" ;;
+esac
