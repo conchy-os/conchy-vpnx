@@ -54,6 +54,9 @@ pub struct Forced {
     pub controller_socket: PathBuf,
     pub mixed_port: u16,
     pub tun: bool,
+    /// Let other machines use the proxy. Off unless the user opts in, whatever
+    /// the subscription or an overlay says.
+    pub allow_lan: bool,
 }
 
 /// One overlay and where it came from, for messages.
@@ -85,6 +88,10 @@ pub enum MergeWarning {
     UnknownGroup { layer: String, group: String },
     /// Every proxy of a group was removed; DIRECT keeps the config valid.
     EmptyGroup { group: String },
+    /// A listener open to the network was dropped (`allow-lan` is off).
+    ExposedListener { name: String, listen: String },
+    /// mihomo's DNS server was moved to loopback (`allow-lan` is off).
+    ExposedDns { listen: String },
 }
 
 impl fmt::Display for MergeWarning {
@@ -116,6 +123,16 @@ impl fmt::Display for MergeWarning {
                     "group `{group}` has no proxies left, {FALLBACK_TARGET} added"
                 )
             }
+            Self::ExposedListener { name, listen } => write!(
+                f,
+                "listener `{name}` on {listen} dropped: it would be reachable from the network \
+                 (set `allow-lan true` in vpnx.kdl to allow)"
+            ),
+            Self::ExposedDns { listen } => write!(
+                f,
+                "DNS server moved from {listen} to 127.0.0.1 \
+                 (set `allow-lan true` in vpnx.kdl to allow)"
+            ),
         }
     }
 }
@@ -169,7 +186,7 @@ pub fn merge(
         apply_layer(&mut cfg, &mut rules, overlay, &name, i + 1, &mut warnings)?;
     }
 
-    apply_forced(&mut cfg, forced);
+    apply_forced(&mut cfg, forced, &mut warnings);
 
     let rules = finish_rules(&cfg, rules, &mut warnings);
     if !rules.is_empty() {
@@ -570,7 +587,7 @@ fn deep_merge(base: &mut Value, overlay: Value) {
     }
 }
 
-fn apply_forced(cfg: &mut Mapping, forced: &Forced) {
+fn apply_forced(cfg: &mut Mapping, forced: &Forced, warnings: &mut Vec<MergeWarning>) {
     // A TCP controller would expose the API to every local user and web page.
     for key in [
         "external-controller",
@@ -589,6 +606,10 @@ fn apply_forced(cfg: &mut Mapping, forced: &Forced) {
             .into(),
     );
     cfg.insert("mixed-port".into(), u64::from(forced.mixed_port).into());
+    cfg.insert("allow-lan".into(), forced.allow_lan.into());
+    if !forced.allow_lan {
+        close_to_network(cfg, warnings);
+    }
 
     let tun = section(cfg, "tun");
     tun.insert("enable".into(), forced.tun.into());
@@ -603,6 +624,60 @@ fn apply_forced(cfg: &mut Mapping, forced: &Forced) {
         dns.insert("enable".into(), true.into());
         set_default(dns, "enhanced-mode", "fake-ip".into());
     }
+}
+
+/// `allow-lan: false` only covers the main ports. Listeners and the DNS
+/// server bind where they are told, so keep those on loopback too.
+fn close_to_network(cfg: &mut Mapping, warnings: &mut Vec<MergeWarning>) {
+    if let Some(Value::Sequence(listeners)) = cfg.get_mut("listeners") {
+        listeners.retain(|l| {
+            // mihomo listens on all interfaces when `listen` is missing.
+            let listen = l.get("listen").and_then(Value::as_str).unwrap_or("0.0.0.0");
+            if is_loopback(listen) {
+                return true;
+            }
+            warnings.push(MergeWarning::ExposedListener {
+                name: item_name(l).unwrap_or("?").to_owned(),
+                listen: listen.to_owned(),
+            });
+            false
+        });
+    }
+    if let Some(Value::Mapping(dns)) = cfg.get_mut("dns") {
+        if let Some(listen) = dns.get("listen").and_then(Value::as_str).map(str::to_owned) {
+            let (host, port) = split_host_port(&listen);
+            if !is_loopback(host) {
+                let local = match port {
+                    Some(port) => format!("127.0.0.1:{port}"),
+                    None => "127.0.0.1".to_owned(),
+                };
+                dns.insert("listen".into(), local.into());
+                warnings.push(MergeWarning::ExposedDns { listen });
+            }
+        }
+    }
+}
+
+/// `host:port`, `[v6]:port`, `:port` or a bare host.
+fn split_host_port(addr: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some((host, tail)) = rest.split_once(']') {
+            return (host, tail.strip_prefix(':'));
+        }
+    }
+    match addr.rsplit_once(':') {
+        // A bare IPv6 address has several colons and no port.
+        Some((host, port)) if !host.contains(':') => (host, Some(port)),
+        _ => (addr, None),
+    }
+}
+
+fn is_loopback(host: &str) -> bool {
+    let host = split_host_port(host).0;
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Get `key` as a mapping, replacing it if it is missing or not a mapping.
@@ -729,6 +804,7 @@ mod tests {
             controller_socket: "/run/user/1000/conchy-vpnx/mihomo.sock".into(),
             mixed_port: 7890,
             tun,
+            allow_lan: false,
         }
     }
 
@@ -1100,5 +1176,60 @@ prepend-rules: ["DOMAIN,local.example,DIRECT"]
         )
         .unwrap_err();
         assert!(matches!(err, MergeError::BadPattern { .. }));
+    }
+
+    #[test]
+    fn lan_access_is_closed_unless_allowed() {
+        let sub = format!(
+            "{SUB}allow-lan: true\nbind-address: '*'\n\
+             dns: {{enable: true, listen: '0.0.0.0:1053'}}\n\
+             listeners:\n  \
+               - {{name: open, type: socks, port: 10808}}\n  \
+               - {{name: lan, type: mixed, port: 10809, listen: 192.168.1.5}}\n  \
+               - {{name: local, type: mixed, port: 10810, listen: 127.0.0.1}}\n"
+        );
+        let out = merge(yaml(&sub), vec![], &forced(false)).unwrap();
+        let c = &out.config;
+        assert_eq!(c["allow-lan"], false);
+        assert_eq!(c["dns"]["listen"], "127.0.0.1:1053");
+        assert_eq!(names(c, "listeners"), ["local"]);
+        assert_eq!(
+            out.warnings
+                .iter()
+                .filter(|w| matches!(
+                    w,
+                    MergeWarning::ExposedListener { .. } | MergeWarning::ExposedDns { .. }
+                ))
+                .count(),
+            3
+        );
+
+        // An overlay cannot open it either; only the user's setting can.
+        let out = merge(yaml(&sub), one(yaml("allow-lan: true")), &forced(false)).unwrap();
+        assert_eq!(out.config["allow-lan"], false);
+        let open = Forced {
+            allow_lan: true,
+            ..forced(false)
+        };
+        let out = merge(yaml(&sub), vec![], &open).unwrap();
+        assert_eq!(out.config["allow-lan"], true);
+        assert_eq!(out.config["dns"]["listen"], "0.0.0.0:1053");
+        assert_eq!(names(&out.config, "listeners").len(), 3);
+    }
+
+    #[test]
+    fn loopback_detection() {
+        for local in [
+            "127.0.0.1",
+            "127.0.0.1:53",
+            "[::1]:53",
+            "::1",
+            "localhost:1053",
+        ] {
+            assert!(is_loopback(local), "{local}");
+        }
+        for open in ["0.0.0.0:53", ":53", "192.168.1.5", "[::]:53", "::"] {
+            assert!(!is_loopback(open), "{open}");
+        }
     }
 }

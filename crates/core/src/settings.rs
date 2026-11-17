@@ -8,6 +8,7 @@
 //! hwid "..."           // device id sent to the subscription server
 //! subscription-update-hours 12   // default: what the server asks for, else 24; 0 = never
 //! overlay "https://raw.githubusercontent.com/me/rules/main/overlay.yaml"  // repeatable
+//! allow-lan false      // let other machines use the proxy (off whatever the subscription says)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -31,6 +32,8 @@ pub struct Settings {
     pub subscription_update_hours: Option<u32>,
     /// Remote overlays, applied in order before the local `overlay.yaml`.
     pub overlays: Vec<String>,
+    /// Let other machines on the network use the proxy.
+    pub allow_lan: bool,
 }
 
 impl Default for Settings {
@@ -43,6 +46,7 @@ impl Default for Settings {
             hwid: None,
             subscription_update_hours: None,
             overlays: Vec::new(),
+            allow_lan: false,
         }
     }
 }
@@ -70,6 +74,9 @@ impl Settings {
         }
         if let Some(v) = doc.get_arg("autoconnect").and_then(|v| v.as_bool()) {
             s.autoconnect = v;
+        }
+        if let Some(v) = doc.get_arg("allow-lan").and_then(|v| v.as_bool()) {
+            s.allow_lan = v;
         }
         if let Some(v) = doc
             .get_arg("subscription-update-hours")

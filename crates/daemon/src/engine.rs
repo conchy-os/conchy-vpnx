@@ -577,6 +577,7 @@ impl Engine {
             controller_socket: self.paths.controller_socket(),
             mixed_port: settings.mixed_port,
             tun: effective == Mode::Tun,
+            allow_lan: settings.allow_lan,
         };
         let merged = merge::merge(sub, layers, &forced)?;
         let warnings: Vec<String> = self

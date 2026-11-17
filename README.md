@@ -48,6 +48,15 @@ The daemon starts on first use through D-Bus activation, so nothing has to be en
   Programs that are already running are not affected.
 - **auto** (default) — TUN when mihomo has the capability, proxy otherwise.
 
+### Network access
+
+By default the proxy is reachable only from this machine: the daemon forces `allow-lan: false`,
+drops `listeners` that listen on anything but loopback and moves mihomo's DNS server
+(`dns.listen`) to `127.0.0.1`, whatever the subscription or an overlay asks for. Each change is
+reported as a warning. To share the proxy with other devices (a phone, a VM), put
+`allow-lan true` in `vpnx.kdl`; then the subscription's `bind-address`, `lan-allowed-ips`,
+listeners and DNS settings apply as written.
+
 ## Subscriptions
 
 The profile must be Clash/mihomo YAML; the daemon asks for it with a `clash.meta` User-Agent,
@@ -81,6 +90,7 @@ autoconnect false    // bring the VPN up when the daemon starts
 // hwid "..."        // device id for the subscription server (default: derived from machine-id)
 // subscription-update-hours 12   // default: what the server asks for, else 24; 0 = off
 // overlay "https://..."          // remote overlays, see below; repeatable
+// allow-lan true                // let other machines use the proxy, see below
 // mihomo "/opt/mihomo/mihomo"   // default: looked up in PATH
 ```
 
