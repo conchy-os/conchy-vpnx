@@ -1,0 +1,15 @@
+[package]
+name = "conchy-vpnx"
+description = "Command-line client for conchy-vpnxd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+zbus.workspace = true
+vpnx-client.workspace = true

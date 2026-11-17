@@ -1,0 +1,17 @@
+[package]
+name = "conchy-vpnxd"
+description = "Daemon that supervises mihomo and exposes org.conchy.Vpnx on D-Bus"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+zbus.workspace = true
+vpnx-core.workspace = true
+vpnx-client.workspace = true

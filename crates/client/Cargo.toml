@@ -1,0 +1,11 @@
+[package]
+name = "vpnx-client"
+description = "Typed D-Bus client for the org.conchy.Vpnx daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+zbus.workspace = true

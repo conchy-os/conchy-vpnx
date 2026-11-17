@@ -1,0 +1,11 @@
+[Unit]
+Description=conchy-vpnx daemon (mihomo supervisor)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/conchy-vpnxd
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

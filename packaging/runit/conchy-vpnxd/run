@@ -1,0 +1,3 @@
+#!/bin/sh
+# User service for runit's per-user runsvdir (~/service) or conchy-session.
+exec conchy-vpnxd 2>&1

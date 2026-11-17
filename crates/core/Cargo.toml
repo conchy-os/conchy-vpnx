@@ -1,0 +1,15 @@
+[package]
+name = "vpnx-core"
+description = "Mihomo config merging, subscription handling and service backends"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
