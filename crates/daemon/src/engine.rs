@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value as Json};
 use tokio::sync::watch;
 use vpnx_core::api::Api;
+use vpnx_core::device::Device;
 use vpnx_core::merge::{self, Forced};
 use vpnx_core::mihomo::{self, Launch, ProcState, Supervisor};
 use vpnx_core::paths::{write_atomic, Paths};
@@ -250,7 +251,7 @@ impl Engine {
         if url.is_empty() {
             bail!("empty subscription URL");
         }
-        subscription::update(url, &self.paths.subscription()).await?;
+        subscription::update(url, &self.paths.subscription(), &self.device()?).await?;
         write_atomic(&self.paths.subscription_url(), url.as_bytes())?;
         self.after_subscription_change().await
     }
@@ -258,8 +259,13 @@ impl Engine {
     pub async fn update_subscription(&mut self) -> Result<()> {
         let url = std::fs::read_to_string(self.paths.subscription_url())
             .context("no subscription set; use `conchy-vpnx subscription set <url>`")?;
-        subscription::update(url.trim(), &self.paths.subscription()).await?;
+        subscription::update(url.trim(), &self.paths.subscription(), &self.device()?).await?;
         self.after_subscription_change().await
+    }
+
+    fn device(&self) -> Result<Device> {
+        let settings = Settings::load(&self.paths.settings)?;
+        Ok(Device::detect(settings.hwid.as_deref()))
     }
 
     async fn after_subscription_change(&mut self) -> Result<()> {

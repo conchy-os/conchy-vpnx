@@ -47,6 +47,15 @@ The daemon starts on first use through D-Bus activation, so nothing has to be en
   Programs that are already running are not affected.
 - **auto** (default) — TUN when mihomo has the capability, proxy otherwise.
 
+## Subscriptions
+
+The profile must be Clash/mihomo YAML; the daemon asks for it with a `clash.meta` User-Agent,
+which most panels answer with YAML. Panels that bind subscriptions to devices (Remnawave and
+compatible) also get `x-hwid`, `x-device-os`, `x-ver-os` and `x-device-model`; the HWID is a
+hash of `/etc/machine-id`, so this machine counts as one device. If the server sends only
+placeholder servers (`0.0.0.0:1`, e.g. "device limit reached"), the daemon reports their names
+as the error instead of connecting to nothing.
+
 ## Files
 
 ```text
@@ -63,6 +72,7 @@ $XDG_RUNTIME_DIR/conchy-vpnx/mihomo.sock  mihomo API (never exposed over TCP)
 mode "auto"          // auto | tun | proxy
 mixed-port 7890
 autoconnect false    // bring the VPN up when the daemon starts
+// hwid "..."        // device id for the subscription server (default: derived from machine-id)
 // mihomo "/opt/mihomo/mihomo"   // default: looked up in PATH
 ```
 

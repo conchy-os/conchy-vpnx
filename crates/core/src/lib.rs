@@ -3,6 +3,7 @@
 pub mod api;
 pub mod caps;
 pub mod conflict;
+pub mod device;
 pub mod merge;
 pub mod mihomo;
 pub mod mode;

@@ -5,6 +5,7 @@
 //! mixed-port 7890
 //! mihomo "/usr/bin/mihomo"
 //! autoconnect true     // bring the VPN up when the daemon starts
+//! hwid "..."           // device id sent to the subscription server
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -22,6 +23,8 @@ pub struct Settings {
     pub mihomo: Option<PathBuf>,
     /// Bring the VPN up as soon as the daemon starts.
     pub autoconnect: bool,
+    /// Device id for the subscription server; derived from machine-id when unset.
+    pub hwid: Option<String>,
 }
 
 impl Default for Settings {
@@ -31,6 +34,7 @@ impl Default for Settings {
             mixed_port: 7890,
             mihomo: None,
             autoconnect: false,
+            hwid: None,
         }
     }
 }
@@ -58,6 +62,9 @@ impl Settings {
         }
         if let Some(v) = doc.get_arg("autoconnect").and_then(|v| v.as_bool()) {
             s.autoconnect = v;
+        }
+        if let Some(v) = doc.get_arg("hwid").and_then(|v| v.as_string()) {
+            s.hwid = Some(v.to_owned()).filter(|v| !v.trim().is_empty());
         }
         Ok(s)
     }
