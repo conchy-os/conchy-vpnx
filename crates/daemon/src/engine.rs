@@ -11,6 +11,7 @@ use vpnx_core::merge::{self, Forced};
 use vpnx_core::mihomo::{self, Launch, ProcState, Supervisor};
 use vpnx_core::paths::{write_atomic, Paths};
 use vpnx_core::settings::Settings;
+use vpnx_core::subscription::Meta;
 use vpnx_core::{caps, conflict, subscription, Mode};
 
 use crate::proxy_env;
@@ -47,6 +48,8 @@ pub struct Status {
     pub can_tun: bool,
     /// The mihomo binary in use, empty when none was found.
     pub mihomo: String,
+    /// JSON with the subscription's title, traffic, expiry and update times.
+    pub subscription: String,
 }
 
 pub struct Engine {
@@ -61,7 +64,16 @@ pub struct Engine {
     notice: Option<String>,
     /// The user's GNOME proxy settings, restored when proxy mode stops.
     saved_proxy: Option<proxy_env::Saved>,
+    /// Why the last subscription download failed.
+    sub_error: Option<String>,
+    /// Unix time of the last automatic download attempt.
+    last_auto_update: Option<u64>,
 }
+
+/// When neither the user nor the server says how often to update.
+const DEFAULT_UPDATE_HOURS: u32 = 24;
+/// Don't hammer a server that is down or unreachable.
+const RETRY_AFTER_FAILURE_SECS: u64 = 30 * 60;
 
 impl Engine {
     pub fn new(paths: Paths, bus: zbus::Connection) -> Result<Self> {
@@ -74,6 +86,7 @@ impl Engine {
             warnings: Vec::new(),
             can_tun: false,
             mihomo: String::new(),
+            subscription: String::new(),
         };
         let engine = Self {
             paths,
@@ -84,8 +97,11 @@ impl Engine {
             running: None,
             notice: None,
             saved_proxy: None,
+            sub_error: None,
+            last_auto_update: None,
         };
         engine.refresh_binary(&settings);
+        engine.publish_subscription();
         Ok(engine)
     }
 
@@ -251,16 +267,103 @@ impl Engine {
         if url.is_empty() {
             bail!("empty subscription URL");
         }
-        subscription::update(url, &self.paths.subscription(), &self.device()?).await?;
-        write_atomic(&self.paths.subscription_url(), url.as_bytes())?;
+        let result = self.download(url).await;
+        if result.is_ok() {
+            write_atomic(&self.paths.subscription_url(), url.as_bytes())?;
+        }
+        self.publish_subscription();
+        result?;
         self.after_subscription_change().await
     }
 
     pub async fn update_subscription(&mut self) -> Result<()> {
-        let url = std::fs::read_to_string(self.paths.subscription_url())
+        let url = self
+            .subscription_url()
             .context("no subscription set; use `conchy-vpnx subscription set <url>`")?;
-        subscription::update(url.trim(), &self.paths.subscription(), &self.device()?).await?;
+        let result = self.download(&url).await;
+        self.publish_subscription();
+        result?;
         self.after_subscription_change().await
+    }
+
+    /// Download and save the profile and what the server says about it.
+    async fn download(&mut self, url: &str) -> Result<()> {
+        let result = async {
+            let meta =
+                subscription::update(url, &self.paths.subscription(), &self.device()?).await?;
+            meta.save(&self.paths.subscription_meta())
+        }
+        .await;
+        self.sub_error = result.as_ref().err().map(|e| format!("{e:#}"));
+        result
+    }
+
+    /// Update the subscription when its interval is up. Called periodically.
+    pub async fn auto_update_subscription(&mut self) {
+        if !self.subscription_due() {
+            return;
+        }
+        self.last_auto_update = Some(subscription::now());
+        match self.update_subscription().await {
+            Ok(()) => tracing::info!("subscription updated"),
+            Err(e) => tracing::warn!("subscription update failed, keeping the old one: {e:#}"),
+        }
+    }
+
+    fn subscription_due(&self) -> bool {
+        if self.subscription_url().is_none() {
+            return false;
+        }
+        let now = subscription::now();
+        if self
+            .last_auto_update
+            .is_some_and(|t| now.saturating_sub(t) < RETRY_AFTER_FAILURE_SECS)
+        {
+            return false;
+        }
+        self.next_update(Meta::load(&self.paths.subscription_meta()).as_ref())
+            .is_some_and(|next| now >= next)
+    }
+
+    /// `None` when auto-update is off.
+    fn next_update(&self, meta: Option<&Meta>) -> Option<u64> {
+        let hours = Settings::load(&self.paths.settings)
+            .ok()
+            .and_then(|s| s.subscription_update_hours)
+            .or_else(|| meta.and_then(|m| m.interval_hours))
+            .unwrap_or(DEFAULT_UPDATE_HOURS);
+        (hours > 0).then(|| meta.map_or(0, |m| m.updated_at) + u64::from(hours) * 3600)
+    }
+
+    fn subscription_url(&self) -> Option<String> {
+        let url = std::fs::read_to_string(self.paths.subscription_url()).ok()?;
+        let url = url.trim();
+        (!url.is_empty()).then(|| url.to_owned())
+    }
+
+    fn publish_subscription(&self) {
+        let url = self.subscription_url();
+        let meta = Meta::load(&self.paths.subscription_meta());
+        let next = url.as_ref().and(self.next_update(meta.as_ref()));
+        let meta = meta.unwrap_or_default();
+        let json = json!({
+            "configured": url.is_some(),
+            "host": url.as_deref().and_then(subscription::display_host),
+            "title": meta.title,
+            "upload": meta.upload,
+            "download": meta.download,
+            "total": meta.total,
+            "expire": meta.expire,
+            "updated_at": (meta.updated_at > 0).then_some(meta.updated_at),
+            "next_update": next,
+            "error": self.sub_error,
+        })
+        .to_string();
+        self.status.send_if_modified(|s| {
+            let changed = s.subscription != json;
+            s.subscription = json;
+            changed
+        });
     }
 
     fn device(&self) -> Result<Device> {

@@ -50,6 +50,10 @@ impl Paths {
     pub fn subscription(&self) -> PathBuf {
         self.data_dir.join("subscription.yaml")
     }
+    /// Title, traffic and expiry from the last download.
+    pub fn subscription_meta(&self) -> PathBuf {
+        self.data_dir.join("subscription.meta.json")
+    }
     pub fn mihomo_home(&self) -> PathBuf {
         self.data_dir.join("mihomo")
     }

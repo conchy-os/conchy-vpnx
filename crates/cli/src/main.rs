@@ -54,6 +54,11 @@ enum Sub {
     Set { url: String },
     /// Download the subscription again
     Update,
+    /// Title, traffic, expiry and update times
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -72,6 +77,16 @@ async fn main() -> Result<()> {
         Command::Reload => vpnx.reload().await?,
         Command::Subscription(Sub::Set { url }) => vpnx.set_subscription(&url).await?,
         Command::Subscription(Sub::Update) => vpnx.update_subscription().await?,
+        Command::Subscription(Sub::Show { json }) => {
+            let text = vpnx.subscription().await?;
+            if json {
+                println!("{text}");
+            } else {
+                for line in subscription_lines(&serde_json::from_str(&text)?) {
+                    println!("{line}");
+                }
+            }
+        }
         Command::Groups { json } => groups(&vpnx, json).await?,
         Command::Select { group, proxy } => vpnx.select_proxy(&group, &proxy).await?,
         Command::Delay { proxy } => println!("{} ms", vpnx.delay(&proxy).await?),
@@ -112,6 +127,10 @@ async fn status(vpnx: &VpnxProxy<'_>, as_json: bool) -> Result<()> {
             println!("tun:   not allowed, run `conchy-vpnx tun enable`")
         }
     }
+    let sub: Value = serde_json::from_str(&vpnx.subscription().await?).unwrap_or_default();
+    if let Some(line) = subscription_lines(&sub).into_iter().next() {
+        println!("sub:   {}", line.trim_start_matches("subscription: "));
+    }
     if !error.is_empty() {
         println!("error: {error}");
     }
@@ -150,6 +169,74 @@ async fn tun(vpnx: &VpnxProxy<'_>, enable: bool) -> Result<()> {
         }
     );
     Ok(())
+}
+
+/// Human-readable lines; the first one is a summary.
+fn subscription_lines(sub: &Value) -> Vec<String> {
+    if sub["configured"] != Value::Bool(true) {
+        return vec!["subscription: none, use `conchy-vpnx subscription set <url>`".into()];
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let name = sub["title"]
+        .as_str()
+        .or(sub["host"].as_str())
+        .unwrap_or("subscription");
+    let mut summary = vec![name.to_owned()];
+    let used = sub["upload"].as_u64().unwrap_or(0) + sub["download"].as_u64().unwrap_or(0);
+    match sub["total"].as_u64().filter(|&t| t > 0) {
+        Some(total) => summary.push(format!("{} of {} used", size(used), size(total))),
+        None if used > 0 => summary.push(format!("{} used", size(used))),
+        None => {}
+    }
+    if let Some(expire) = sub["expire"].as_u64().filter(|&e| e > 0) {
+        summary.push(if expire <= now {
+            "expired".into()
+        } else {
+            format!("{} left", span(expire - now))
+        });
+    }
+    let mut lines = vec![format!("subscription: {}", summary.join(" · "))];
+    if let Some(host) = sub["host"].as_str() {
+        lines.push(format!("server:       {host}"));
+    }
+    if let Some(at) = sub["updated_at"].as_u64() {
+        lines.push(format!(
+            "updated:      {} ago",
+            span(now.saturating_sub(at))
+        ));
+    }
+    match sub["next_update"].as_u64() {
+        Some(next) if next > now => lines.push(format!("next update:  in {}", span(next - now))),
+        Some(_) => lines.push("next update:  due".into()),
+        None => lines.push("next update:  off".into()),
+    }
+    if let Some(err) = sub["error"].as_str() {
+        lines.push(format!("last error:   {err}"));
+    }
+    lines
+}
+
+fn size(bytes: u64) -> String {
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let gb = bytes as f64 / GB;
+    if gb >= 10.0 {
+        format!("{gb:.0} GB")
+    } else if gb >= 0.1 {
+        format!("{gb:.1} GB")
+    } else {
+        format!("{:.0} MB", bytes as f64 / 1024.0 / 1024.0)
+    }
+}
+
+fn span(secs: u64) -> String {
+    match secs {
+        s if s < 3600 => format!("{} min", s / 60),
+        s if s < 2 * 86400 => format!("{} h", s / 3600),
+        s => format!("{} days", s / 86400),
+    }
 }
 
 async fn groups(vpnx: &VpnxProxy<'_>, as_json: bool) -> Result<()> {

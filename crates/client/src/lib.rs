@@ -43,6 +43,12 @@ pub trait Vpnx {
     /// The mihomo binary in use; empty when it is not installed.
     #[zbus(property)]
     fn mihomo_path(&self) -> zbus::Result<String>;
+    /// JSON: `{"configured", "host", "title", "upload", "download", "total",
+    /// "expire", "updated_at", "next_update", "error"}`. Sizes in bytes, times
+    /// in Unix seconds; unknown values are `null`, `total`/`expire` of 0 mean
+    /// unlimited.
+    #[zbus(property)]
+    fn subscription(&self) -> zbus::Result<String>;
 }
 
 /// Root helper installed next to the binaries (`packaging/conchy-vpnx-tun`).

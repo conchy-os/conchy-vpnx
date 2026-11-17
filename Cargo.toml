@@ -31,6 +31,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 xattr = "1"
 libc = "0.2"
 sha2 = "0.10"
+base64 = "0.22"
 tempfile = "3"
 vpnx-core = { path = "crates/core" }
 vpnx-client = { path = "crates/client" }

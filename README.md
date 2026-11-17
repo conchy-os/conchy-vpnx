@@ -17,6 +17,7 @@ Linux session with D-Bus (systemd or runit).
 
 ```sh
 conchy-vpnx subscription set https://provider.example/sub   # download a Clash/mihomo profile
+conchy-vpnx subscription show      # title, traffic, expiry, next update
 conchy-vpnx up
 conchy-vpnx status
 conchy-vpnx groups                 # proxy groups, `*` marks the selected proxy
@@ -56,6 +57,11 @@ hash of `/etc/machine-id`, so this machine counts as one device. If the server s
 placeholder servers (`0.0.0.0:1`, e.g. "device limit reached"), the daemon reports their names
 as the error instead of connecting to nothing.
 
+The subscription is updated in the background as often as the server asks
+(`profile-update-interval`, otherwise every 24 hours); a failed update keeps the previous
+profile and is retried after 30 minutes. Title, traffic and expiry come from the `profile-title`
+and `subscription-userinfo` headers.
+
 ## Files
 
 ```text
@@ -73,6 +79,7 @@ mode "auto"          // auto | tun | proxy
 mixed-port 7890
 autoconnect false    // bring the VPN up when the daemon starts
 // hwid "..."        // device id for the subscription server (default: derived from machine-id)
+// subscription-update-hours 12   // default: what the server asks for, else 24; 0 = off
 // mihomo "/opt/mihomo/mihomo"   // default: looked up in PATH
 ```
 

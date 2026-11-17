@@ -6,6 +6,7 @@
 //! mihomo "/usr/bin/mihomo"
 //! autoconnect true     // bring the VPN up when the daemon starts
 //! hwid "..."           // device id sent to the subscription server
+//! subscription-update-hours 12   // default: what the server asks for, else 24; 0 = never
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -25,6 +26,8 @@ pub struct Settings {
     pub autoconnect: bool,
     /// Device id for the subscription server; derived from machine-id when unset.
     pub hwid: Option<String>,
+    /// Auto-update interval; `None` follows the server, 0 turns it off.
+    pub subscription_update_hours: Option<u32>,
 }
 
 impl Default for Settings {
@@ -35,6 +38,7 @@ impl Default for Settings {
             mihomo: None,
             autoconnect: false,
             hwid: None,
+            subscription_update_hours: None,
         }
     }
 }
@@ -62,6 +66,13 @@ impl Settings {
         }
         if let Some(v) = doc.get_arg("autoconnect").and_then(|v| v.as_bool()) {
             s.autoconnect = v;
+        }
+        if let Some(v) = doc
+            .get_arg("subscription-update-hours")
+            .and_then(|v| v.as_i64())
+        {
+            s.subscription_update_hours =
+                Some(u32::try_from(v).context("subscription-update-hours out of range")?);
         }
         if let Some(v) = doc.get_arg("hwid").and_then(|v| v.as_string()) {
             s.hwid = Some(v.to_owned()).filter(|v| !v.trim().is_empty());

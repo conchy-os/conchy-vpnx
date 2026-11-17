@@ -123,7 +123,15 @@ impl Vpnx {
     async fn mihomo_path(&self) -> String {
         self.status.borrow().mihomo.clone()
     }
+
+    #[zbus(property)]
+    async fn subscription(&self) -> String {
+        self.status.borrow().subscription.clone()
+    }
 }
+
+/// How often to check whether the subscription is due.
+const SUBSCRIPTION_CHECK: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -190,6 +198,9 @@ async fn main() -> Result<()> {
             if now.mihomo != last.mihomo {
                 let _ = i.mihomo_path_changed(ctx).await;
             }
+            if now.subscription != last.subscription {
+                let _ = i.subscription_changed(ctx).await;
+            }
             last = now;
         }
     });
@@ -200,6 +211,18 @@ async fn main() -> Result<()> {
             tracing::info!("autoconnect is on, bringing the VPN up");
             if let Err(e) = engine.lock().await.up().await {
                 tracing::warn!("autoconnect failed: {e:#}");
+            }
+        });
+    }
+
+    {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            // Give the network a moment after login before the first check.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            loop {
+                engine.lock().await.auto_update_subscription().await;
+                tokio::time::sleep(SUBSCRIPTION_CHECK).await;
             }
         });
     }
