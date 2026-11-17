@@ -10,7 +10,7 @@ use vpnx_core::merge::{self, Forced};
 use vpnx_core::mihomo::{self, Launch, ProcState, Supervisor};
 use vpnx_core::paths::{write_atomic, Paths};
 use vpnx_core::settings::Settings;
-use vpnx_core::{caps, subscription, Mode};
+use vpnx_core::{caps, conflict, subscription, Mode};
 
 use crate::proxy_env;
 
@@ -56,6 +56,10 @@ pub struct Engine {
     supervisor: Option<Supervisor>,
     /// Mode and port the running mihomo was started with.
     running: Option<(Mode, u16)>,
+    /// Why `auto` fell back to proxy, shown with the merge warnings.
+    notice: Option<String>,
+    /// The user's GNOME proxy settings, restored when proxy mode stops.
+    saved_proxy: Option<proxy_env::Saved>,
 }
 
 impl Engine {
@@ -77,6 +81,8 @@ impl Engine {
             proc: Arc::new(watch::channel(ProcState::Stopped).0),
             supervisor: None,
             running: None,
+            notice: None,
+            saved_proxy: None,
         };
         engine.refresh_binary(&settings);
         Ok(engine)
@@ -170,7 +176,7 @@ impl Engine {
         let settings = Settings::load(&self.paths.settings)?;
         self.refresh_binary(&settings);
         let bin = settings.mihomo_bin()?;
-        let effective = effective_mode(&settings, &bin)?;
+        let effective = self.effective_mode(&settings, &bin).await?;
         self.build_config(&settings, &bin, effective).await?;
 
         let launch = Launch {
@@ -182,7 +188,7 @@ impl Engine {
         self.supervisor = Some(Supervisor::start(launch, self.proc.clone()).await?);
         self.running = Some((effective, settings.mixed_port));
         if effective == Mode::Proxy {
-            proxy_env::set(&self.bus, settings.mixed_port).await;
+            self.saved_proxy = Some(proxy_env::set(&self.bus, settings.mixed_port).await);
         }
         self.status.send_modify(|s| {
             s.state = State::Up;
@@ -204,7 +210,7 @@ impl Engine {
             sup.stop().await;
         }
         if let Some((Mode::Proxy, _)) = self.running.take() {
-            proxy_env::clear(&self.bus).await;
+            proxy_env::clear(&self.bus, self.saved_proxy.take()).await;
         }
     }
 
@@ -214,7 +220,7 @@ impl Engine {
         self.status.send_modify(|s| s.mode = settings.mode);
         self.refresh_binary(&settings);
         let bin = settings.mihomo_bin()?;
-        let effective = effective_mode(&settings, &bin)?;
+        let effective = self.effective_mode(&settings, &bin).await?;
 
         if !self.is_running() {
             // Validate only, so errors show up before the user hits "up".
@@ -324,7 +330,12 @@ impl Engine {
             tun: effective == Mode::Tun,
         };
         let merged = merge::merge(sub, overlay, &forced)?;
-        let warnings: Vec<String> = merged.warnings.iter().map(ToString::to_string).collect();
+        let warnings: Vec<String> = self
+            .notice
+            .iter()
+            .cloned()
+            .chain(merged.warnings.iter().map(ToString::to_string))
+            .collect();
         for w in &warnings {
             tracing::warn!("merge: {w}");
         }
@@ -357,23 +368,44 @@ impl Engine {
             }
         });
     }
-}
 
-fn effective_mode(settings: &Settings, bin: &std::path::Path) -> Result<Mode> {
-    let can_tun = caps::can_tun(bin);
-    match settings.mode {
-        Mode::Auto if can_tun => Ok(Mode::Tun),
-        Mode::Auto => {
-            tracing::info!(
-                "no CAP_NET_ADMIN, using proxy mode; for TUN run: {}",
+    /// Resolve `auto`, and refuse TUN while another VPN holds all traffic.
+    async fn effective_mode(&mut self, settings: &Settings, bin: &std::path::Path) -> Result<Mode> {
+        self.notice = None;
+        let can_tun = caps::can_tun(bin);
+        let wants_tun = match settings.mode {
+            Mode::Proxy => return Ok(Mode::Proxy),
+            Mode::Tun if !can_tun => bail!(
+                "TUN mode needs CAP_NET_ADMIN for mihomo; run `conchy-vpnx tun enable` or: {}",
                 caps::grant_hint(bin)
+            ),
+            Mode::Tun => true,
+            Mode::Auto => can_tun,
+        };
+        if !wants_tun {
+            tracing::info!(
+                "no CAP_NET_ADMIN, using proxy mode; run `conchy-vpnx tun enable` for TUN"
             );
-            Ok(Mode::Proxy)
+            return Ok(Mode::Proxy);
         }
-        Mode::Tun if !can_tun => bail!(
-            "TUN mode needs CAP_NET_ADMIN for mihomo; run: {}",
-            caps::grant_hint(bin)
-        ),
-        m => Ok(m),
+        // Our own TUN is up: its routes would look like a foreign one.
+        if matches!(self.running, Some((Mode::Tun, _))) && self.is_running() {
+            return Ok(Mode::Tun);
+        }
+        let Some(dev) = conflict::foreign_tunnel().await else {
+            return Ok(Mode::Tun);
+        };
+        if settings.mode == Mode::Tun {
+            bail!(
+                "another VPN already sends all traffic through `{dev}`; \
+                 turn off its TUN mode or use proxy mode"
+            );
+        }
+        let notice = format!(
+            "another VPN already sends all traffic through `{dev}`, using proxy mode instead of TUN"
+        );
+        tracing::warn!("{notice}");
+        self.notice = Some(notice);
+        Ok(Mode::Proxy)
     }
 }

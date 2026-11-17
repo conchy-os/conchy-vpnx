@@ -37,11 +37,14 @@ The daemon starts on first use through D-Bus activation, so nothing has to be en
   `conchy-vpnx-tun` helper through pkexec. It sets the capability and leaves a marker in
   `/etc/conchy-vpnx/tun-enabled`, so the package hooks restore it after mihomo upgrades.
   Note that the capability applies to the mihomo binary, i.e. to every user of the machine.
-  Don't run another mihomo-based client in TUN mode at the same time (e.g. FlClash): both use
-  routing table 2022 and the same `ip rule`s.
+  Two TUN clients break each other's routing (mihomo-based ones share routing table 2022 and
+  the same `ip rule`s), so if another VPN already sends all traffic into its own TUN device
+  (FlClash, sing-box, OpenVPN, a Tailscale exit node, ...), `auto` falls back to proxy mode with
+  a warning and `tun` refuses to start.
 - **proxy** — mihomo listens on `127.0.0.1:<mixed-port>`; the daemon sets `http_proxy`/`https_proxy`/
   `all_proxy` for newly started programs (D-Bus activation environment and the systemd user
-  manager) and the GNOME proxy settings. Programs that are already running are not affected.
+  manager) and the GNOME proxy settings; your own GNOME proxy settings come back on `down`.
+  Programs that are already running are not affected.
 - **auto** (default) — TUN when mihomo has the capability, proxy otherwise.
 
 ## Files
