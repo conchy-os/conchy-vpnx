@@ -7,6 +7,7 @@
 //! autoconnect true     // bring the VPN up when the daemon starts
 //! hwid "..."           // device id sent to the subscription server
 //! subscription-update-hours 12   // default: what the server asks for, else 24; 0 = never
+//! overlay "https://raw.githubusercontent.com/me/rules/main/overlay.yaml"  // repeatable
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -28,6 +29,8 @@ pub struct Settings {
     pub hwid: Option<String>,
     /// Auto-update interval; `None` follows the server, 0 turns it off.
     pub subscription_update_hours: Option<u32>,
+    /// Remote overlays, applied in order before the local `overlay.yaml`.
+    pub overlays: Vec<String>,
 }
 
 impl Default for Settings {
@@ -39,6 +42,7 @@ impl Default for Settings {
             autoconnect: false,
             hwid: None,
             subscription_update_hours: None,
+            overlays: Vec::new(),
         }
     }
 }
@@ -74,6 +78,13 @@ impl Settings {
             s.subscription_update_hours =
                 Some(u32::try_from(v).context("subscription-update-hours out of range")?);
         }
+        s.overlays = doc
+            .nodes()
+            .iter()
+            .filter(|n| n.name().value() == "overlay")
+            .filter_map(|n| n.get(0).and_then(|v| v.value().as_string()))
+            .map(str::to_owned)
+            .collect();
         if let Some(v) = doc.get_arg("hwid").and_then(|v| v.as_string()) {
             s.hwid = Some(v.to_owned()).filter(|v| !v.trim().is_empty());
         }
@@ -98,6 +109,37 @@ impl Settings {
         }
         crate::paths::write_atomic(path, doc.to_string().as_bytes())?;
         Ok(())
+    }
+
+    /// Add an `overlay "url"` node, keeping the rest of the file intact.
+    /// Returns `false` if it was already there.
+    pub fn add_overlay(path: &Path, url: &str) -> Result<bool> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut doc: KdlDocument = text.parse()?;
+        if Self::parse(&text)?.overlays.iter().any(|u| u == url) {
+            return Ok(false);
+        }
+        let mut node = KdlNode::new("overlay");
+        node.push(url);
+        doc.nodes_mut().push(node);
+        crate::paths::write_atomic(path, doc.to_string().as_bytes())?;
+        Ok(true)
+    }
+
+    /// Remove `overlay "url"` nodes. Returns `false` if there was none.
+    pub fn remove_overlay(path: &Path, url: &str) -> Result<bool> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut doc: KdlDocument = text.parse()?;
+        let before = doc.nodes().len();
+        doc.nodes_mut().retain(|n| {
+            !(n.name().value() == "overlay"
+                && n.get(0).and_then(|v| v.value().as_string()) == Some(url))
+        });
+        if doc.nodes().len() == before {
+            return Ok(false);
+        }
+        crate::paths::write_atomic(path, doc.to_string().as_bytes())?;
+        Ok(true)
     }
 
     /// The mihomo binary to run.
@@ -125,6 +167,23 @@ mod tests {
         assert_eq!(s.mixed_port, 1080);
         assert_eq!(Settings::parse("").unwrap(), Settings::default());
         assert!(Settings::parse("mode \"wat\"").is_err());
+    }
+
+    #[test]
+    fn overlays_are_added_and_removed_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vpnx.kdl");
+        std::fs::write(&path, "// mine\nmode \"tun\"\n").unwrap();
+        assert!(Settings::add_overlay(&path, "https://a.example/o.yaml").unwrap());
+        assert!(Settings::add_overlay(&path, "file:///b.yaml").unwrap());
+        assert!(!Settings::add_overlay(&path, "file:///b.yaml").unwrap());
+        let s = Settings::load(&path).unwrap();
+        assert_eq!(s.overlays, ["https://a.example/o.yaml", "file:///b.yaml"]);
+        assert!(Settings::remove_overlay(&path, "https://a.example/o.yaml").unwrap());
+        assert!(!Settings::remove_overlay(&path, "https://a.example/o.yaml").unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("// mine") && text.contains("mode \"tun\""));
+        assert_eq!(Settings::load(&path).unwrap().overlays, ["file:///b.yaml"]);
     }
 
     #[test]

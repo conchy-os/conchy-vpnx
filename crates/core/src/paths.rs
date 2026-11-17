@@ -50,6 +50,10 @@ impl Paths {
     pub fn subscription(&self) -> PathBuf {
         self.data_dir.join("subscription.yaml")
     }
+    /// Cached copies of remote overlays.
+    pub fn overlay_cache(&self) -> PathBuf {
+        self.data_dir.join("overlays")
+    }
     /// Title, traffic and expiry from the last download.
     pub fn subscription_meta(&self) -> PathBuf {
         self.data_dir.join("subscription.meta.json")

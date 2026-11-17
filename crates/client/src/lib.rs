@@ -26,6 +26,11 @@ pub trait Vpnx {
     fn select_proxy(&self, group: &str, name: &str) -> zbus::Result<()>;
     /// Latency in milliseconds.
     fn delay(&self, proxy: &str) -> zbus::Result<u32>;
+    /// Add a remote overlay (merged before the local `overlay.yaml`).
+    fn add_overlay(&self, url: &str) -> zbus::Result<()>;
+    fn remove_overlay(&self, url: &str) -> zbus::Result<()>;
+    /// Download the remote overlays again and apply them.
+    fn update_overlays(&self) -> zbus::Result<()>;
 
     #[zbus(property)]
     fn state(&self) -> zbus::Result<String>;
@@ -49,6 +54,9 @@ pub trait Vpnx {
     /// unlimited.
     #[zbus(property)]
     fn subscription(&self) -> zbus::Result<String>;
+    /// JSON list: `[{"url", "label", "updated_at", "error"}]`, in merge order.
+    #[zbus(property)]
+    fn overlays(&self) -> zbus::Result<String>;
 }
 
 /// Root helper installed next to the binaries (`packaging/conchy-vpnx-tun`).

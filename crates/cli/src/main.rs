@@ -32,6 +32,9 @@ enum Command {
     /// Manage the subscription
     #[command(subcommand)]
     Subscription(Sub),
+    /// Remote overlays: merge configs downloaded from the network
+    #[command(subcommand)]
+    Overlay(OverlayCmd),
     /// List proxy groups and the selected proxy
     Groups {
         #[arg(long)]
@@ -59,6 +62,21 @@ enum Sub {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum OverlayCmd {
+    /// Remote overlays in merge order (the local overlay.yaml comes last)
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add an overlay by URL (https:// or file://); it is downloaded first
+    Add { url: String },
+    /// Remove an overlay by URL or by its number in `list`
+    Remove { which: String },
+    /// Download all overlays again and apply them
+    Update,
 }
 
 #[tokio::main]
@@ -90,6 +108,7 @@ async fn main() -> Result<()> {
         Command::Groups { json } => groups(&vpnx, json).await?,
         Command::Select { group, proxy } => vpnx.select_proxy(&group, &proxy).await?,
         Command::Delay { proxy } => println!("{} ms", vpnx.delay(&proxy).await?),
+        Command::Overlay(cmd) => overlay(&vpnx, cmd).await?,
         Command::Tun { action } => tun(&vpnx, action == "enable").await?,
     }
     Ok(())
@@ -168,6 +187,55 @@ async fn tun(vpnx: &VpnxProxy<'_>, enable: bool) -> Result<()> {
             "not available"
         }
     );
+    Ok(())
+}
+
+async fn overlay(vpnx: &VpnxProxy<'_>, cmd: OverlayCmd) -> Result<()> {
+    let list = || async {
+        let text = vpnx.overlays().await?;
+        anyhow::Ok(serde_json::from_str::<Vec<Value>>(&text)?)
+    };
+    match cmd {
+        OverlayCmd::List { json } => {
+            if json {
+                println!("{}", vpnx.overlays().await?);
+                return Ok(());
+            }
+            let items = list().await?;
+            if items.is_empty() {
+                println!("no remote overlays; add one with `conchy-vpnx overlay add <url>`");
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            for (i, o) in items.iter().enumerate() {
+                let status = match (o["error"].as_str(), o["updated_at"].as_u64()) {
+                    (Some(e), _) => format!("error: {e}"),
+                    (None, Some(at)) => format!("updated {} ago", span(now.saturating_sub(at))),
+                    (None, None) => "not downloaded".into(),
+                };
+                println!(
+                    "{}. {}\n   {status}",
+                    i + 1,
+                    o["url"].as_str().unwrap_or("?")
+                );
+            }
+        }
+        OverlayCmd::Add { url } => vpnx.add_overlay(&url).await?,
+        OverlayCmd::Remove { which } => {
+            let url = match which.parse::<usize>() {
+                Ok(n) => list()
+                    .await?
+                    .get(n.wrapping_sub(1))
+                    .and_then(|o| o["url"].as_str().map(str::to_owned))
+                    .with_context(|| format!("no overlay number {n}"))?,
+                Err(_) => which,
+            };
+            vpnx.remove_overlay(&url).await?;
+        }
+        OverlayCmd::Update => vpnx.update_overlays().await?,
+    }
     Ok(())
 }
 

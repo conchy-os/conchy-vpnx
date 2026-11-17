@@ -80,29 +80,69 @@ mixed-port 7890
 autoconnect false    // bring the VPN up when the daemon starts
 // hwid "..."        // device id for the subscription server (default: derived from machine-id)
 // subscription-update-hours 12   // default: what the server asks for, else 24; 0 = off
+// overlay "https://..."          // remote overlays, see below; repeatable
 // mihomo "/opt/mihomo/mihomo"   // default: looked up in PATH
 ```
 
-### Merging rules (`overlay.yaml`)
+### Merging rules (overlays)
+
+The config is built in layers: the subscription, then remote overlays in the order they were
+added, then your `~/.config/conchy/vpnx/overlay.yaml`. Each overlay applies to everything before
+it, so your local file can also undo what a remote overlay did.
 
 ```yaml
-prepend-rules:                 # checked before the subscription's rules
+# Changes to what earlier layers built (applied first):
+delete-rules:                  # rule fields, or /regex/ over the whole rule
+  - DOMAIN-SUFFIX,example.com  #   matches DOMAIN-SUFFIX,example.com,<any target>[,...]
+  - /^GEOIP,/
+replace-rule-targets:          # rules sent to one group now go to another
+  "Old group": "New group"
+delete-proxies: [some-node, /^Expired/]   # names or /regex/; removed from groups too
+delete-proxy-groups: [Ads]                # rules that used it fall back to DIRECT
+modify-proxy-groups:
+  "Proxy":
+    prepend-proxies: [my-node] # put first (moved if already there)
+    append-proxies: []
+    remove-proxies: [/RU/]     # names or /regex/
+    interval: 300              # any other group key is overridden
+
+# Additions:
+prepend-rules:                 # before every earlier rule
   - DOMAIN-SUFFIX,work.corp,DIRECT
-append-rules:                  # after the subscription's rules, before MATCH
+append-rules:                  # after them, before MATCH
   - DOMAIN-KEYWORD,ads,REJECT
-prepend-proxies: []            # same name as a subscription proxy replaces it
+prepend-proxies: []            # same name as an existing proxy replaces it
 append-proxies: []
 prepend-proxy-groups: []
 append-proxy-groups: []
 rule-providers: {}             # merged by key
-# any other key is deep-merged over the subscription (dns, sniffer, ...)
+# any other key is deep-merged (dns, sniffer, ...)
 ```
 
-- A `MATCH` rule from the overlay replaces the subscription's; `MATCH` is always last.
+- The `MATCH` of the latest layer wins and is always last.
 - Rules pointing at a group that no longer exists go to `DIRECT`, with a warning
-  (`conchy-vpnx status`), instead of breaking the whole config.
+  (`conchy-vpnx status`), instead of breaking the whole config. So do delete/replace entries that
+  matched nothing, e.g. after the provider renamed a group.
+- A group left without proxies gets `DIRECT`, so the config stays valid.
 - Every new config is checked with `mihomo -t` first; if mihomo rejects it, the previous one keeps
   running.
+
+### Remote overlays
+
+Keep an overlay in a git repository (or a gist, any web server) and share it between machines:
+
+```sh
+conchy-vpnx overlay add https://raw.githubusercontent.com/me/vpn-rules/main/overlay.yaml
+conchy-vpnx overlay list
+conchy-vpnx overlay update         # also happens with every subscription update
+conchy-vpnx overlay remove 1       # by number or URL
+```
+
+They are listed as `overlay "url"` in `vpnx.kdl`, downloaded before being added (a broken link is
+refused) and cached, so the VPN starts offline; a failed update keeps the previous copy. A remote
+overlay can change anything except the settings the daemon forces (controller, ports, TUN), so
+only add sources you trust. URLs never appear in error messages, so private links with a token
+in the query string stay private.
 
 ## Installation
 

@@ -1,5 +1,6 @@
 //! The daemon's state machine: build the config, run mihomo, set the proxy.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -7,8 +8,9 @@ use serde_json::{json, Value as Json};
 use tokio::sync::watch;
 use vpnx_core::api::Api;
 use vpnx_core::device::Device;
-use vpnx_core::merge::{self, Forced};
+use vpnx_core::merge::{self, Forced, Layer};
 use vpnx_core::mihomo::{self, Launch, ProcState, Supervisor};
+use vpnx_core::overlay;
 use vpnx_core::paths::{write_atomic, Paths};
 use vpnx_core::settings::Settings;
 use vpnx_core::subscription::Meta;
@@ -50,6 +52,8 @@ pub struct Status {
     pub mihomo: String,
     /// JSON with the subscription's title, traffic, expiry and update times.
     pub subscription: String,
+    /// JSON list of remote overlays: url, label, updated_at, error.
+    pub overlays: String,
 }
 
 pub struct Engine {
@@ -68,6 +72,8 @@ pub struct Engine {
     sub_error: Option<String>,
     /// Unix time of the last automatic download attempt.
     last_auto_update: Option<u64>,
+    /// Why the last download of a remote overlay failed, by URL.
+    overlay_errors: HashMap<String, String>,
 }
 
 /// When neither the user nor the server says how often to update.
@@ -87,6 +93,7 @@ impl Engine {
             can_tun: false,
             mihomo: String::new(),
             subscription: String::new(),
+            overlays: String::new(),
         };
         let engine = Self {
             paths,
@@ -99,9 +106,11 @@ impl Engine {
             saved_proxy: None,
             sub_error: None,
             last_auto_update: None,
+            overlay_errors: HashMap::new(),
         };
         engine.refresh_binary(&settings);
         engine.publish_subscription();
+        engine.publish_overlays();
         Ok(engine)
     }
 
@@ -273,6 +282,7 @@ impl Engine {
         }
         self.publish_subscription();
         result?;
+        self.fetch_overlays().await;
         self.after_subscription_change().await
     }
 
@@ -283,6 +293,7 @@ impl Engine {
         let result = self.download(&url).await;
         self.publish_subscription();
         result?;
+        self.fetch_overlays().await;
         self.after_subscription_change().await
     }
 
@@ -333,6 +344,102 @@ impl Engine {
             .or_else(|| meta.and_then(|m| m.interval_hours))
             .unwrap_or(DEFAULT_UPDATE_HOURS);
         (hours > 0).then(|| meta.map_or(0, |m| m.updated_at) + u64::from(hours) * 3600)
+    }
+
+    /// Add a remote overlay; it is downloaded first so a bad link is
+    /// refused instead of saved.
+    pub async fn add_overlay(&mut self, url: &str) -> Result<()> {
+        let url = url.trim();
+        if url.is_empty() {
+            bail!("empty overlay URL");
+        }
+        overlay::fetch(url, &overlay::cache_path(&self.paths.overlay_cache(), url))
+            .await
+            .with_context(|| format!("overlay {}", overlay::label(url)))?;
+        self.overlay_errors.remove(url);
+        if !Settings::add_overlay(&self.paths.settings, url)? {
+            bail!("this overlay is already added");
+        }
+        self.publish_overlays();
+        self.reload().await
+    }
+
+    pub async fn remove_overlay(&mut self, url: &str) -> Result<()> {
+        if !Settings::remove_overlay(&self.paths.settings, url)? {
+            bail!("no such overlay; see `conchy-vpnx overlay list`");
+        }
+        let _ = std::fs::remove_file(overlay::cache_path(&self.paths.overlay_cache(), url));
+        self.overlay_errors.remove(url);
+        self.publish_overlays();
+        self.reload().await
+    }
+
+    /// Download every remote overlay again and apply them.
+    pub async fn update_overlays(&mut self) -> Result<()> {
+        self.fetch_overlays().await;
+        let failed: Vec<String> = self
+            .overlay_errors
+            .iter()
+            .map(|(url, e)| format!("{}: {e}", overlay::label(url)))
+            .collect();
+        self.reload().await?;
+        if !failed.is_empty() {
+            bail!("kept the previous copy of {}", failed.join("; "));
+        }
+        Ok(())
+    }
+
+    /// Refresh all cached overlays; failures keep the old copy.
+    async fn fetch_overlays(&mut self) {
+        let urls = Settings::load(&self.paths.settings)
+            .map(|s| s.overlays)
+            .unwrap_or_default();
+        for url in urls {
+            self.fetch_overlay(&url).await;
+        }
+        self.publish_overlays();
+    }
+
+    async fn fetch_overlay(&mut self, url: &str) {
+        let dest = overlay::cache_path(&self.paths.overlay_cache(), url);
+        match overlay::fetch(url, &dest).await {
+            Ok(()) => {
+                self.overlay_errors.remove(url);
+            }
+            Err(e) => {
+                tracing::warn!("overlay {}: {e:#}", overlay::label(url));
+                self.overlay_errors.insert(url.to_owned(), format!("{e:#}"));
+            }
+        }
+    }
+
+    fn publish_overlays(&self) {
+        let urls = Settings::load(&self.paths.settings)
+            .map(|s| s.overlays)
+            .unwrap_or_default();
+        let list: Vec<Json> = urls
+            .iter()
+            .map(|url| {
+                let cache = overlay::cache_path(&self.paths.overlay_cache(), url);
+                let updated_at = std::fs::metadata(&cache)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+                json!({
+                    "url": url,
+                    "label": overlay::label(url),
+                    "updated_at": updated_at,
+                    "error": self.overlay_errors.get(url),
+                })
+            })
+            .collect();
+        let json = Json::Array(list).to_string();
+        self.status.send_if_modified(|s| {
+            let changed = s.overlays != json;
+            s.overlays = json;
+            changed
+        });
     }
 
     fn subscription_url(&self) -> Option<String> {
@@ -428,21 +535,48 @@ impl Engine {
         let sub_text = std::fs::read_to_string(&sub_path)
             .context("no subscription yet; use `conchy-vpnx subscription set <url>`")?;
         let sub = subscription::parse(&sub_text)?;
-        let overlay = match std::fs::read_to_string(self.paths.overlay()) {
-            Ok(t) => Some(serde_yaml::from_str(&t).context("overlay.yaml is not valid YAML")?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        let mut layers = Vec::new();
+        let mut notes = Vec::new();
+        for url in &settings.overlays {
+            let cache = overlay::cache_path(&self.paths.overlay_cache(), url);
+            if !cache.exists() {
+                // Added by editing vpnx.kdl: fetch it on first use.
+                self.fetch_overlay(url).await;
+            }
+            let label = overlay::label(url);
+            match std::fs::read_to_string(&cache)
+                .map_err(anyhow::Error::from)
+                .and_then(|t| overlay::parse(&t))
+            {
+                Ok(value) => layers.push(Layer { name: label, value }),
+                Err(_) => notes.push(format!(
+                    "remote overlay {label} is not available yet, skipped: {}",
+                    self.overlay_errors
+                        .get(url)
+                        .map_or("not downloaded", String::as_str)
+                )),
+            }
+        }
+        match std::fs::read_to_string(self.paths.overlay()) {
+            Ok(t) => layers.push(Layer {
+                name: "overlay.yaml".into(),
+                value: serde_yaml::from_str(&t).context("overlay.yaml is not valid YAML")?,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).context("reading overlay.yaml"),
-        };
+        }
+        self.publish_overlays();
         let forced = Forced {
             controller_socket: self.paths.controller_socket(),
             mixed_port: settings.mixed_port,
             tun: effective == Mode::Tun,
         };
-        let merged = merge::merge(sub, overlay, &forced)?;
+        let merged = merge::merge(sub, layers, &forced)?;
         let warnings: Vec<String> = self
             .notice
             .iter()
             .cloned()
+            .chain(notes)
             .chain(merged.warnings.iter().map(ToString::to_string))
             .collect();
         for w in &warnings {

@@ -1,17 +1,20 @@
-//! Builds the final mihomo config from three layers:
+//! Builds the final mihomo config from layers:
 //!
 //! 1. the subscription profile,
-//! 2. the user overlay (`prepend-rules`, `append-proxies`, ... plus a deep merge
-//!    of every other key),
+//! 2. overlays, each applied on top of everything before it: remote ones
+//!    first, the user's `overlay.yaml` last,
 //! 3. settings forced by conchy-vpnx (controller socket, ports, TUN/DNS).
 //!
-//! Merging works on raw [`serde_yaml::Value`]s so keys unknown to us pass
-//! through untouched and new mihomo features need no changes here.
+//! An overlay can delete or retarget earlier rules, delete or edit proxies and
+//! groups, add its own (`prepend-rules`, `append-proxies`, ...) and deep-merge
+//! any other key. Merging works on raw [`serde_yaml::Value`]s so keys unknown
+//! to us pass through untouched and new mihomo features need no changes here.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 
+use regex::Regex;
 use serde_yaml::{Mapping, Value};
 
 /// Rule targets that are always valid without a matching proxy or group.
@@ -31,13 +34,33 @@ const NAMED_LISTS: &[(&str, &str, &str)] = &[
 ];
 const PREPEND_RULES: &str = "prepend-rules";
 const APPEND_RULES: &str = "append-rules";
+const DELETE_RULES: &str = "delete-rules";
+const REPLACE_TARGETS: &str = "replace-rule-targets";
+const DELETE_PROXIES: &str = "delete-proxies";
+const DELETE_GROUPS: &str = "delete-proxy-groups";
+const MODIFY_GROUPS: &str = "modify-proxy-groups";
 
-/// Settings conchy-vpnx always controls, applied after the overlay.
+/// Group keys that fill a group without a `proxies` list.
+const GROUP_SOURCES: &[&str] = &[
+    "use",
+    "include-all",
+    "include-all-proxies",
+    "include-all-providers",
+];
+
+/// Settings conchy-vpnx always controls, applied after the overlays.
 #[derive(Debug, Clone)]
 pub struct Forced {
     pub controller_socket: PathBuf,
     pub mixed_port: u16,
     pub tun: bool,
+}
+
+/// One overlay and where it came from, for messages.
+#[derive(Debug, Clone)]
+pub struct Layer {
+    pub name: String,
+    pub value: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +75,16 @@ pub enum MergeWarning {
     MalformedRule { rule: String },
     /// More than one `MATCH` rule; only the effective one is kept.
     ExtraMatch { rule: String },
+    /// A delete/replace entry matched nothing, e.g. the subscription changed.
+    Unused {
+        layer: String,
+        key: &'static str,
+        entry: String,
+    },
+    /// `modify-proxy-groups` names a group that does not exist.
+    UnknownGroup { layer: String, group: String },
+    /// Every proxy of a group was removed; DIRECT keeps the config valid.
+    EmptyGroup { group: String },
 }
 
 impl fmt::Display for MergeWarning {
@@ -71,6 +104,18 @@ impl fmt::Display for MergeWarning {
             ),
             Self::MalformedRule { rule } => write!(f, "rule `{rule}` is malformed, dropped"),
             Self::ExtraMatch { rule } => write!(f, "extra MATCH rule `{rule}` dropped"),
+            Self::Unused { layer, key, entry } => {
+                write!(f, "{layer}: `{key}` entry `{entry}` matched nothing")
+            }
+            Self::UnknownGroup { layer, group } => {
+                write!(f, "{layer}: `{MODIFY_GROUPS}`: no group named `{group}`")
+            }
+            Self::EmptyGroup { group } => {
+                write!(
+                    f,
+                    "group `{group}` has no proxies left, {FALLBACK_TARGET} added"
+                )
+            }
         }
     }
 }
@@ -78,9 +123,20 @@ impl fmt::Display for MergeWarning {
 #[derive(Debug, thiserror::Error)]
 pub enum MergeError {
     #[error("{0} is not a YAML mapping")]
-    NotAMapping(&'static str),
-    #[error("`{key}` in the {layer} must be a list")]
-    NotAList { layer: &'static str, key: String },
+    NotAMapping(String),
+    #[error("`{key}` in {layer} must be a {expected}")]
+    WrongType {
+        layer: String,
+        key: String,
+        expected: &'static str,
+    },
+    #[error("{layer}: bad pattern `{pattern}` in `{key}`: {error}")]
+    BadPattern {
+        layer: String,
+        key: &'static str,
+        pattern: String,
+        error: regex::Error,
+    },
 }
 
 #[derive(Debug)]
@@ -89,44 +145,33 @@ pub struct Merged {
     pub warnings: Vec<MergeWarning>,
 }
 
+/// A rule and the layer it came from (0 = subscription).
+type Rule = (Value, usize);
+
 pub fn merge(
     subscription: Value,
-    overlay: Option<Value>,
+    layers: Vec<Layer>,
     forced: &Forced,
 ) -> Result<Merged, MergeError> {
-    let mut cfg = into_mapping(subscription, "subscription")?;
-    let mut overlay = match overlay {
-        None | Some(Value::Null) => Mapping::new(),
-        Some(v) => into_mapping(v, "overlay")?,
-    };
+    let mut cfg = into_mapping(subscription, "the subscription")?;
+    let mut rules: Vec<Rule> = take_list_from(&mut cfg, "rules", "the subscription")?
+        .into_iter()
+        .map(|r| (r, 0))
+        .collect();
+    let mut warnings = Vec::new();
 
-    for (key, pre, app) in NAMED_LISTS {
-        let pre = take_list(&mut overlay, pre)?;
-        let app = take_list(&mut overlay, app)?;
-        let base = take_list_from(&mut cfg, key, "subscription")?;
-        if base.is_empty() && pre.is_empty() && app.is_empty() {
-            continue;
-        }
-        cfg.insert((*key).into(), Value::Sequence(merge_named(pre, base, app)));
-    }
-
-    let user_pre = take_list(&mut overlay, PREPEND_RULES)?;
-    let user_app = take_list(&mut overlay, APPEND_RULES)?;
-    let base_rules = take_list_from(&mut cfg, "rules", "subscription")?;
-
-    for (k, v) in overlay {
-        match cfg.get_mut(&k) {
-            Some(existing) => deep_merge(existing, v),
-            None => {
-                cfg.insert(k, v);
-            }
-        }
+    for (i, layer) in layers.into_iter().enumerate() {
+        let name = layer.name;
+        let overlay = match layer.value {
+            Value::Null => Mapping::new(),
+            v => into_mapping(v, &name)?,
+        };
+        apply_layer(&mut cfg, &mut rules, overlay, &name, i + 1, &mut warnings)?;
     }
 
     apply_forced(&mut cfg, forced);
 
-    let mut warnings = Vec::new();
-    let rules = merge_rules(&cfg, user_pre, base_rules, user_app, &mut warnings);
+    let rules = finish_rules(&cfg, rules, &mut warnings);
     if !rules.is_empty() {
         cfg.insert("rules".into(), Value::Sequence(rules));
     }
@@ -137,29 +182,341 @@ pub fn merge(
     })
 }
 
-fn into_mapping(v: Value, what: &'static str) -> Result<Mapping, MergeError> {
-    match v {
-        Value::Mapping(m) => Ok(m),
-        _ => Err(MergeError::NotAMapping(what)),
+fn apply_layer(
+    cfg: &mut Mapping,
+    rules: &mut Vec<Rule>,
+    mut overlay: Mapping,
+    name: &str,
+    index: usize,
+    warnings: &mut Vec<MergeWarning>,
+) -> Result<(), MergeError> {
+    // Removals and edits apply to what earlier layers built...
+    for pattern in patterns(&mut overlay, DELETE_RULES, name)? {
+        let before = rules.len();
+        rules.retain(|(r, _)| !r.as_str().is_some_and(|r| pattern.matches_rule(r)));
+        if rules.len() == before {
+            warnings.push(pattern.unused(name, DELETE_RULES));
+        }
+    }
+    for (from, to) in string_map(&mut overlay, REPLACE_TARGETS, name)? {
+        let mut used = false;
+        for (rule, _) in rules.iter_mut() {
+            if let Some(new) = rule.as_str().and_then(|text| retarget(text, &from, &to)) {
+                *rule = Value::String(new);
+                used = true;
+            }
+        }
+        if !used {
+            warnings.push(MergeWarning::Unused {
+                layer: name.into(),
+                key: REPLACE_TARGETS,
+                entry: from,
+            });
+        }
+    }
+    let mut deleted = Vec::new();
+    for (key, list) in [(DELETE_PROXIES, "proxies"), (DELETE_GROUPS, "proxy-groups")] {
+        for pattern in patterns(&mut overlay, key, name)? {
+            let Some(Value::Sequence(items)) = cfg.get_mut(list) else {
+                warnings.push(pattern.unused(name, key));
+                continue;
+            };
+            let before = items.len();
+            items.retain(|item| match item_name(item) {
+                Some(n) if pattern.matches_name(n) => {
+                    deleted.push(n.to_owned());
+                    false
+                }
+                _ => true,
+            });
+            if items.len() == before {
+                warnings.push(pattern.unused(name, key));
+            }
+        }
+    }
+    if !deleted.is_empty() {
+        remove_group_members(cfg, &deleted, warnings);
+    }
+
+    // ...then this layer adds its own.
+    for (key, pre, app) in NAMED_LISTS {
+        let pre = take_list_from(&mut overlay, pre, name)?;
+        let app = take_list_from(&mut overlay, app, name)?;
+        if pre.is_empty() && app.is_empty() {
+            continue;
+        }
+        let base = take_list_from(cfg, key, name)?;
+        cfg.insert((*key).into(), Value::Sequence(merge_named(pre, base, app)));
+    }
+    modify_groups(cfg, &mut overlay, name, warnings)?;
+
+    let pre = take_list_from(&mut overlay, PREPEND_RULES, name)?;
+    let app = take_list_from(&mut overlay, APPEND_RULES, name)?;
+    if !pre.is_empty() || !app.is_empty() {
+        let earlier = std::mem::take(rules);
+        rules.extend(pre.into_iter().map(|r| (r, index)));
+        rules.extend(earlier);
+        rules.extend(app.into_iter().map(|r| (r, index)));
+    }
+
+    for (k, v) in overlay {
+        match cfg.get_mut(&k) {
+            Some(existing) => deep_merge(existing, v),
+            None => {
+                cfg.insert(k, v);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A delete entry: rule fields (`DOMAIN-SUFFIX,example.com` matches that rule
+/// whatever its target), an exact name, or `/regex/`.
+enum Pattern {
+    Regex(Regex),
+    Literal(String),
+}
+
+impl Pattern {
+    fn parse(raw: &str, name: &str, key: &'static str) -> Result<Self, MergeError> {
+        match raw.strip_prefix('/').and_then(|r| r.strip_suffix('/')) {
+            Some(re) if !re.is_empty() => {
+                Regex::new(re)
+                    .map(Self::Regex)
+                    .map_err(|error| MergeError::BadPattern {
+                        layer: name.into(),
+                        key,
+                        pattern: raw.into(),
+                        error,
+                    })
+            }
+            _ => Ok(Self::Literal(raw.trim().to_owned())),
+        }
+    }
+
+    fn matches_rule(&self, rule: &str) -> bool {
+        match self {
+            Self::Regex(re) => re.is_match(rule),
+            Self::Literal(prefix) => {
+                let want = split_rule(prefix);
+                let have = split_rule(rule);
+                want.len() <= have.len()
+                    && want.iter().zip(&have).enumerate().all(|(i, (w, h))| {
+                        // Rule types are case-insensitive, payloads are not.
+                        if i == 0 {
+                            w.eq_ignore_ascii_case(h)
+                        } else {
+                            w == h
+                        }
+                    })
+            }
+        }
+    }
+
+    fn matches_name(&self, name: &str) -> bool {
+        match self {
+            Self::Regex(re) => re.is_match(name),
+            Self::Literal(literal) => literal == name,
+        }
+    }
+
+    fn unused(&self, layer: &str, key: &'static str) -> MergeWarning {
+        MergeWarning::Unused {
+            layer: layer.into(),
+            key,
+            entry: match self {
+                Self::Regex(re) => format!("/{}/", re.as_str()),
+                Self::Literal(l) => l.clone(),
+            },
+        }
     }
 }
 
-fn take_list(m: &mut Mapping, key: &str) -> Result<Vec<Value>, MergeError> {
-    take_list_from(m, key, "overlay")
+fn patterns(m: &mut Mapping, key: &'static str, layer: &str) -> Result<Vec<Pattern>, MergeError> {
+    take_list_from(m, key, layer)?
+        .iter()
+        .map(|v| match v.as_str() {
+            Some(s) => Pattern::parse(s, layer, key),
+            None => Err(wrong_type(layer, key, "list of strings")),
+        })
+        .collect()
 }
 
-fn take_list_from(
+fn string_map(
     m: &mut Mapping,
-    key: &str,
-    layer: &'static str,
-) -> Result<Vec<Value>, MergeError> {
+    key: &'static str,
+    layer: &str,
+) -> Result<Vec<(String, String)>, MergeError> {
+    match m.remove(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Mapping(map)) => map
+            .into_iter()
+            .map(|(k, v)| match (k.as_str(), v.as_str()) {
+                (Some(k), Some(v)) => Ok((k.to_owned(), v.to_owned())),
+                _ => Err(wrong_type(layer, key, "mapping of names to names")),
+            })
+            .collect(),
+        Some(_) => Err(wrong_type(layer, key, "mapping")),
+    }
+}
+
+fn wrong_type(layer: &str, key: &str, expected: &'static str) -> MergeError {
+    MergeError::WrongType {
+        layer: layer.into(),
+        key: key.into(),
+        expected,
+    }
+}
+
+/// The rule with target `from` replaced by `to`, if it targets `from`.
+fn retarget(rule: &str, from: &str, to: &str) -> Option<String> {
+    let mut parts = split_rule(rule);
+    let idx = target_index(&parts[0].to_ascii_uppercase())?;
+    if parts.get(idx) != Some(&from) {
+        return None;
+    }
+    parts[idx] = to;
+    Some(parts.join(","))
+}
+
+fn group_proxies(group: &mut Value) -> Option<&mut Vec<Value>> {
+    match group.get_mut("proxies") {
+        Some(Value::Sequence(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// Keep a group valid after its proxies were removed.
+fn ensure_not_empty(group: &mut Value, warnings: &mut Vec<MergeWarning>) {
+    let filled_elsewhere = GROUP_SOURCES.iter().any(|k| group.get(k).is_some());
+    let name = item_name(group).unwrap_or("?").to_owned();
+    if filled_elsewhere {
+        return;
+    }
+    if let Some(list) = group_proxies(group) {
+        if list.is_empty() {
+            list.push(FALLBACK_TARGET.into());
+            warnings.push(MergeWarning::EmptyGroup { group: name });
+        }
+    }
+}
+
+/// Drop deleted proxies and groups from every group that lists them.
+fn remove_group_members(cfg: &mut Mapping, deleted: &[String], warnings: &mut Vec<MergeWarning>) {
+    let Some(Value::Sequence(groups)) = cfg.get_mut("proxy-groups") else {
+        return;
+    };
+    for group in groups {
+        let Some(list) = group_proxies(group) else {
+            continue;
+        };
+        let before = list.len();
+        list.retain(|p| !p.as_str().is_some_and(|p| deleted.iter().any(|d| d == p)));
+        if list.len() != before {
+            ensure_not_empty(group, warnings);
+        }
+    }
+}
+
+/// `modify-proxy-groups: {Name: {prepend-proxies, append-proxies,
+/// remove-proxies, <any other group key>}}`.
+fn modify_groups(
+    cfg: &mut Mapping,
+    overlay: &mut Mapping,
+    layer: &str,
+    warnings: &mut Vec<MergeWarning>,
+) -> Result<(), MergeError> {
+    let edits = match overlay.remove(MODIFY_GROUPS) {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Mapping(m)) => m,
+        Some(_) => return Err(wrong_type(layer, MODIFY_GROUPS, "mapping of group names")),
+    };
+    for (group_name, edit) in edits {
+        let Some(group_name) = group_name.as_str().map(str::to_owned) else {
+            return Err(wrong_type(layer, MODIFY_GROUPS, "mapping of group names"));
+        };
+        let mut edit = match edit {
+            Value::Mapping(m) => m,
+            _ => return Err(wrong_type(layer, MODIFY_GROUPS, "mapping per group")),
+        };
+        let key = |k: &str| format!("{MODIFY_GROUPS}.{group_name}.{k}");
+        let remove: Vec<Pattern> = take_list_from(&mut edit, "remove-proxies", layer)?
+            .iter()
+            .map(|v| match v.as_str() {
+                Some(s) => Pattern::parse(s, layer, MODIFY_GROUPS),
+                None => Err(wrong_type(layer, &key("remove-proxies"), "list of strings")),
+            })
+            .collect::<Result<_, _>>()?;
+        let pre = take_list_from(&mut edit, "prepend-proxies", layer)?;
+        let app = take_list_from(&mut edit, "append-proxies", layer)?;
+
+        let group = match cfg.get_mut("proxy-groups") {
+            Some(Value::Sequence(groups)) => groups
+                .iter_mut()
+                .find(|g| item_name(g) == Some(group_name.as_str())),
+            _ => None,
+        };
+        let Some(group) = group else {
+            warnings.push(MergeWarning::UnknownGroup {
+                layer: layer.into(),
+                group: group_name,
+            });
+            continue;
+        };
+
+        for (k, v) in edit {
+            match group.get_mut(&k) {
+                Some(existing) => deep_merge(existing, v),
+                None => {
+                    if let Value::Mapping(g) = group {
+                        g.insert(k, v);
+                    }
+                }
+            }
+        }
+        if remove.is_empty() && pre.is_empty() && app.is_empty() {
+            continue;
+        }
+        if group_proxies(group).is_none() {
+            if let Value::Mapping(g) = group {
+                g.insert("proxies".into(), Value::Sequence(Vec::new()));
+            }
+        }
+        let Some(list) = group_proxies(group) else {
+            continue;
+        };
+        for pattern in &remove {
+            let before = list.len();
+            list.retain(|p| !p.as_str().is_some_and(|p| pattern.matches_name(p)));
+            if list.len() == before {
+                warnings.push(pattern.unused(layer, MODIFY_GROUPS));
+            }
+        }
+        let added: HashSet<&str> = pre.iter().chain(&app).filter_map(Value::as_str).collect();
+        let kept: Vec<Value> = list
+            .drain(..)
+            .filter(|p| !p.as_str().is_some_and(|p| added.contains(p)))
+            .collect();
+        list.extend(pre.iter().cloned());
+        list.extend(kept);
+        list.extend(app.iter().cloned());
+        ensure_not_empty(group, warnings);
+    }
+    Ok(())
+}
+
+fn into_mapping(v: Value, what: &str) -> Result<Mapping, MergeError> {
+    match v {
+        Value::Mapping(m) => Ok(m),
+        _ => Err(MergeError::NotAMapping(what.into())),
+    }
+}
+
+fn take_list_from(m: &mut Mapping, key: &str, layer: &str) -> Result<Vec<Value>, MergeError> {
     match m.remove(key) {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Sequence(s)) => Ok(s),
-        Some(_) => Err(MergeError::NotAList {
-            layer,
-            key: key.into(),
-        }),
+        Some(_) => Err(wrong_type(layer, key, "list")),
     }
 }
 
@@ -293,13 +650,8 @@ fn target_index(kind: &str) -> Option<usize> {
     }
 }
 
-fn merge_rules(
-    cfg: &Mapping,
-    user_pre: Vec<Value>,
-    base: Vec<Value>,
-    user_app: Vec<Value>,
-    warnings: &mut Vec<MergeWarning>,
-) -> Vec<Value> {
+/// Check targets, drop malformed rules and keep one `MATCH`, last.
+fn finish_rules(cfg: &Mapping, rules: Vec<Rule>, warnings: &mut Vec<MergeWarning>) -> Vec<Value> {
     let mut known: HashSet<&str> = BUILTIN_TARGETS.iter().copied().collect();
     for key in ["proxies", "proxy-groups"] {
         if let Some(Value::Sequence(items)) = cfg.get(key) {
@@ -310,20 +662,9 @@ fn merge_rules(
     let has_providers =
         matches!(cfg.get("proxy-providers"), Some(Value::Mapping(m)) if !m.is_empty());
 
-    // Iterate user rules first so the user's MATCH is the one that wins, then
-    // restore the final order: prepend, subscription, append.
-    const PRE: u8 = 0;
-    const BASE: u8 = 1;
-    const APP: u8 = 2;
-    let ordered = user_pre
-        .into_iter()
-        .map(|r| (r, PRE))
-        .chain(user_app.into_iter().map(|r| (r, APP)))
-        .chain(base.into_iter().map(|r| (r, BASE)));
-
-    let mut rules = Vec::new();
-    let mut matches = Vec::new();
-    for (raw, origin) in ordered {
+    let mut out = Vec::new();
+    let mut matches: Vec<(String, usize)> = Vec::new();
+    for (raw, layer) in rules {
         let Some(text) = raw.as_str() else {
             warnings.push(MergeWarning::MalformedRule {
                 rule: format!("{raw:?}"),
@@ -333,7 +674,7 @@ fn merge_rules(
         let mut parts = split_rule(text);
         let kind = parts[0].to_ascii_uppercase();
         let Some(idx) = target_index(&kind) else {
-            rules.push((raw, origin));
+            out.push(raw);
             continue;
         };
         let Some(&target) = parts.get(idx) else {
@@ -355,21 +696,27 @@ fn merge_rules(
             }
         }
         if kind == "MATCH" {
-            matches.push(rule);
+            matches.push((rule, layer));
         } else {
-            rules.push((Value::String(rule), origin));
+            out.push(Value::String(rule));
         }
     }
 
-    rules.sort_by_key(|(_, origin)| *origin);
-    let mut out: Vec<Value> = rules.into_iter().map(|(r, _)| r).collect();
-
-    // The user's MATCH (seen first) wins over the subscription's.
-    let mut matches = matches.into_iter();
-    if let Some(m) = matches.next() {
-        out.push(Value::String(m));
+    // The MATCH of the latest layer wins: the user's beats the subscription's.
+    if let Some(winner) = matches
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, (_, layer))| (*layer, std::cmp::Reverse(*i)))
+        .map(|(i, _)| i)
+    {
+        let (rule, _) = matches.remove(winner);
+        out.push(Value::String(rule));
     }
-    warnings.extend(matches.map(|rule| MergeWarning::ExtraMatch { rule }));
+    warnings.extend(
+        matches
+            .into_iter()
+            .map(|(rule, _)| MergeWarning::ExtraMatch { rule }),
+    );
     out
 }
 
@@ -387,6 +734,34 @@ mod tests {
 
     fn yaml(s: &str) -> Value {
         serde_yaml::from_str(s).unwrap()
+    }
+
+    fn layer(name: &str, s: &str) -> Layer {
+        Layer {
+            name: name.into(),
+            value: yaml(s),
+        }
+    }
+
+    fn one(value: Value) -> Vec<Layer> {
+        vec![Layer {
+            name: "overlay.yaml".into(),
+            value,
+        }]
+    }
+
+    fn group_members(v: &Value, group: &str) -> Vec<String> {
+        v["proxy-groups"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|g| g["name"] == group)
+            .unwrap()["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap().to_owned())
+            .collect()
     }
 
     fn rules(v: &Value) -> Vec<&str> {
@@ -429,7 +804,7 @@ prepend-rules: ['DOMAIN,work.corp,DIRECT']
 append-rules: ['DOMAIN-KEYWORD,ads,REJECT']
 "#,
         );
-        let out = merge(yaml(SUB), Some(overlay), &forced(false)).unwrap();
+        let out = merge(yaml(SUB), one(overlay), &forced(false)).unwrap();
         assert_eq!(
             rules(&out.config),
             [
@@ -446,7 +821,7 @@ append-rules: ['DOMAIN-KEYWORD,ads,REJECT']
     #[test]
     fn user_match_overrides_subscription_match() {
         let overlay = yaml("append-rules: ['MATCH,DIRECT']");
-        let out = merge(yaml(SUB), Some(overlay), &forced(false)).unwrap();
+        let out = merge(yaml(SUB), one(overlay), &forced(false)).unwrap();
         assert_eq!(rules(&out.config).last(), Some(&"MATCH,DIRECT"));
         assert_eq!(
             out.warnings,
@@ -459,7 +834,7 @@ append-rules: ['DOMAIN-KEYWORD,ads,REJECT']
     #[test]
     fn unknown_target_is_rewritten_to_direct() {
         let overlay = yaml("prepend-rules: ['DOMAIN,x.com,Gone,no-resolve']");
-        let out = merge(yaml(SUB), Some(overlay), &forced(false)).unwrap();
+        let out = merge(yaml(SUB), one(overlay), &forced(false)).unwrap();
         assert_eq!(rules(&out.config)[0], "DOMAIN,x.com,DIRECT,no-resolve");
         assert!(matches!(
             &out.warnings[0],
@@ -471,7 +846,7 @@ append-rules: ['DOMAIN-KEYWORD,ads,REJECT']
     fn unknown_target_kept_when_providers_exist() {
         let sub = format!("{SUB}\nproxy-providers: {{p: {{type: http, url: 'https://x'}}}}");
         let overlay = yaml("prepend-rules: ['DOMAIN,x.com,FromProvider']");
-        let out = merge(yaml(&sub), Some(overlay), &forced(false)).unwrap();
+        let out = merge(yaml(&sub), one(overlay), &forced(false)).unwrap();
         assert_eq!(rules(&out.config)[0], "DOMAIN,x.com,FromProvider");
         assert!(matches!(
             &out.warnings[0],
@@ -485,7 +860,7 @@ append-rules: ['DOMAIN-KEYWORD,ads,REJECT']
     #[test]
     fn logical_rules_target_is_checked() {
         let overlay = yaml("prepend-rules: ['AND,((DOMAIN,a.com),(NETWORK,UDP)),Proxy']");
-        let out = merge(yaml(SUB), Some(overlay), &forced(false)).unwrap();
+        let out = merge(yaml(SUB), one(overlay), &forced(false)).unwrap();
         assert_eq!(
             rules(&out.config)[0],
             "AND,((DOMAIN,a.com),(NETWORK,UDP)),Proxy"
@@ -502,7 +877,7 @@ append-proxies: [{name: c, type: trojan}]
 prepend-proxy-groups: [{name: Mine, type: select, proxies: [c]}]
 "#,
         );
-        let out = merge(yaml(SUB), Some(overlay), &forced(false)).unwrap();
+        let out = merge(yaml(SUB), one(overlay), &forced(false)).unwrap();
         assert_eq!(names(&out.config, "proxies"), ["b", "a", "c"]);
         assert_eq!(out.config["proxies"][0]["type"], "vless");
         assert_eq!(names(&out.config, "proxy-groups"), ["Mine", "Proxy"]);
@@ -512,7 +887,7 @@ prepend-proxy-groups: [{name: Mine, type: select, proxies: [c]}]
     fn other_keys_deep_merge() {
         let sub = format!("{SUB}\ndns: {{enable: false, nameserver: [1.1.1.1]}}\nlog-level: info");
         let overlay = yaml("dns: {nameserver: [9.9.9.9], ipv6: true}\nlog-level: debug");
-        let out = merge(yaml(&sub), Some(overlay), &forced(false)).unwrap();
+        let out = merge(yaml(&sub), one(overlay), &forced(false)).unwrap();
         let dns = &out.config["dns"];
         assert_eq!(dns["enable"], false);
         assert_eq!(dns["ipv6"], true);
@@ -523,7 +898,7 @@ prepend-proxy-groups: [{name: Mine, type: select, proxies: [c]}]
     #[test]
     fn forced_settings_win_and_remove_tcp_controller() {
         let overlay = yaml("mixed-port: 1111\nexternal-controller: 127.0.0.1:9090");
-        let out = merge(yaml(SUB), Some(overlay), &forced(false)).unwrap();
+        let out = merge(yaml(SUB), one(overlay), &forced(false)).unwrap();
         let c = &out.config;
         assert_eq!(c["mixed-port"], 7890);
         assert!(c.get("external-controller").is_none());
@@ -538,7 +913,7 @@ prepend-proxy-groups: [{name: Mine, type: select, proxies: [c]}]
     #[test]
     fn tun_mode_enables_dns_but_respects_user_choices() {
         let overlay = yaml("tun: {stack: gvisor}\ndns: {enhanced-mode: redir-host}");
-        let out = merge(yaml(SUB), Some(overlay), &forced(true)).unwrap();
+        let out = merge(yaml(SUB), one(overlay), &forced(true)).unwrap();
         let c = &out.config;
         assert_eq!(c["tun"]["enable"], true);
         assert_eq!(c["tun"]["stack"], "gvisor");
@@ -550,14 +925,180 @@ prepend-proxy-groups: [{name: Mine, type: select, proxies: [c]}]
     #[test]
     fn malformed_rules_are_dropped() {
         let overlay = yaml("prepend-rules: ['DOMAIN,only-two', 42]");
-        let out = merge(yaml(SUB), Some(overlay), &forced(false)).unwrap();
+        let out = merge(yaml(SUB), one(overlay), &forced(false)).unwrap();
         assert_eq!(rules(&out.config).len(), 3);
         assert_eq!(out.warnings.len(), 2);
     }
 
     #[test]
     fn rejects_non_mapping_input() {
-        assert!(merge(yaml("[1, 2]"), None, &forced(false)).is_err());
-        assert!(merge(yaml(SUB), Some(yaml("prepend-rules: oops")), &forced(false)).is_err());
+        assert!(merge(yaml("[1, 2]"), vec![], &forced(false)).is_err());
+        assert!(merge(yaml(SUB), one(yaml("prepend-rules: oops")), &forced(false)).is_err());
+    }
+
+    #[test]
+    fn delete_rules_by_fields_and_regex() {
+        let overlay = yaml(
+            r#"
+delete-rules:
+  - "DOMAIN-SUFFIX,google.com"
+  - "/^GEOIP,/"
+  - "domain,nothing.example"
+"#,
+        );
+        let out = merge(yaml(SUB), one(overlay), &forced(false)).unwrap();
+        assert_eq!(rules(&out.config), ["MATCH,Proxy"]);
+        assert_eq!(
+            out.warnings,
+            [MergeWarning::Unused {
+                layer: "overlay.yaml".into(),
+                key: DELETE_RULES,
+                entry: "domain,nothing.example".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn field_patterns_do_not_match_partial_values() {
+        let p = Pattern::Literal("DOMAIN-SUFFIX,google.com".into());
+        assert!(p.matches_rule("domain-suffix,google.com,Proxy,no-resolve"));
+        assert!(!p.matches_rule("DOMAIN-SUFFIX,google.com.evil,Proxy"));
+        assert!(!p.matches_rule("DOMAIN-SUFFIX,Google.com,Proxy"));
+    }
+
+    #[test]
+    fn replace_targets_only_touches_earlier_rules() {
+        let overlay = yaml(
+            r#"
+replace-rule-targets: {Proxy: DIRECT, Missing: REJECT}
+prepend-rules: ["DOMAIN,mine.example,Proxy"]
+"#,
+        );
+        let out = merge(yaml(SUB), one(overlay), &forced(false)).unwrap();
+        assert_eq!(
+            rules(&out.config),
+            [
+                "DOMAIN,mine.example,Proxy",
+                "DOMAIN-SUFFIX,google.com,DIRECT",
+                "GEOIP,CN,DIRECT",
+                "MATCH,DIRECT"
+            ]
+        );
+        assert!(matches!(
+            &out.warnings[..],
+            [MergeWarning::Unused { key: REPLACE_TARGETS, entry, .. }] if entry == "Missing"
+        ));
+    }
+
+    #[test]
+    fn deleted_proxies_leave_groups_valid() {
+        let out = merge(
+            yaml(SUB),
+            one(yaml("delete-proxies: [\"/^a$/\"]")),
+            &forced(false),
+        )
+        .unwrap();
+        assert_eq!(names(&out.config, "proxies"), ["b"]);
+        assert_eq!(group_members(&out.config, "Proxy"), ["b"]);
+
+        let out = merge(
+            yaml(SUB),
+            one(yaml("delete-proxies: [a, b]")),
+            &forced(false),
+        )
+        .unwrap();
+        assert_eq!(group_members(&out.config, "Proxy"), ["DIRECT"]);
+        assert!(out.warnings.contains(&MergeWarning::EmptyGroup {
+            group: "Proxy".into()
+        }));
+    }
+
+    #[test]
+    fn deleted_group_rules_fall_back_to_direct() {
+        let out = merge(
+            yaml(SUB),
+            one(yaml("delete-proxy-groups: [Proxy]")),
+            &forced(false),
+        )
+        .unwrap();
+        assert!(names(&out.config, "proxy-groups").is_empty());
+        assert_eq!(rules(&out.config)[0], "DOMAIN-SUFFIX,google.com,DIRECT");
+    }
+
+    #[test]
+    fn modify_groups_edits_members_and_keys() {
+        let overlay = yaml(
+            r#"
+append-proxies: [{name: c, type: ss}]
+modify-proxy-groups:
+  Proxy:
+    prepend-proxies: [c]
+    remove-proxies: [a]
+    type: url-test
+    interval: 300
+  Nope:
+    append-proxies: [c]
+"#,
+        );
+        let out = merge(yaml(SUB), one(overlay), &forced(false)).unwrap();
+        assert_eq!(group_members(&out.config, "Proxy"), ["c", "b"]);
+        let group = &out.config["proxy-groups"][0];
+        assert_eq!(group["type"], "url-test");
+        assert_eq!(group["interval"], 300);
+        assert_eq!(
+            out.warnings,
+            [MergeWarning::UnknownGroup {
+                layer: "overlay.yaml".into(),
+                group: "Nope".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn layers_apply_in_order() {
+        let remote = layer(
+            "remote",
+            r#"
+prepend-rules: ["DOMAIN,remote.example,REJECT", "MATCH,DIRECT"]
+append-proxies: [{name: r, type: ss}]
+"#,
+        );
+        // The local overlay can undo what the remote one added.
+        let local = layer(
+            "overlay.yaml",
+            r#"
+delete-rules: ["DOMAIN,remote.example"]
+delete-proxies: [r]
+prepend-rules: ["DOMAIN,local.example,DIRECT"]
+"#,
+        );
+        let out = merge(yaml(SUB), vec![remote, local], &forced(false)).unwrap();
+        assert_eq!(
+            rules(&out.config),
+            [
+                "DOMAIN,local.example,DIRECT",
+                "DOMAIN-SUFFIX,google.com,Proxy",
+                "GEOIP,CN,DIRECT",
+                "MATCH,DIRECT"
+            ]
+        );
+        assert_eq!(names(&out.config, "proxies"), ["a", "b"]);
+        assert_eq!(
+            out.warnings,
+            [MergeWarning::ExtraMatch {
+                rule: "MATCH,Proxy".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn bad_regex_is_an_error() {
+        let err = merge(
+            yaml(SUB),
+            one(yaml("delete-rules: [\"/(/\"]")),
+            &forced(false),
+        )
+        .unwrap_err();
+        assert!(matches!(err, MergeError::BadPattern { .. }));
     }
 }

@@ -65,6 +65,33 @@ impl Vpnx {
             .map_err(failed)
     }
 
+    async fn add_overlay(&self, url: &str) -> fdo::Result<()> {
+        self.engine
+            .lock()
+            .await
+            .add_overlay(url)
+            .await
+            .map_err(failed)
+    }
+
+    async fn remove_overlay(&self, url: &str) -> fdo::Result<()> {
+        self.engine
+            .lock()
+            .await
+            .remove_overlay(url)
+            .await
+            .map_err(failed)
+    }
+
+    async fn update_overlays(&self) -> fdo::Result<()> {
+        self.engine
+            .lock()
+            .await
+            .update_overlays()
+            .await
+            .map_err(failed)
+    }
+
     async fn groups(&self) -> fdo::Result<String> {
         let groups = self.engine.lock().await.groups().await.map_err(failed)?;
         Ok(groups.to_string())
@@ -127,6 +154,11 @@ impl Vpnx {
     #[zbus(property)]
     async fn subscription(&self) -> String {
         self.status.borrow().subscription.clone()
+    }
+
+    #[zbus(property)]
+    async fn overlays(&self) -> String {
+        self.status.borrow().overlays.clone()
     }
 }
 
@@ -200,6 +232,9 @@ async fn main() -> Result<()> {
             }
             if now.subscription != last.subscription {
                 let _ = i.subscription_changed(ctx).await;
+            }
+            if now.overlays != last.overlays {
+                let _ = i.overlays_changed(ctx).await;
             }
             last = now;
         }

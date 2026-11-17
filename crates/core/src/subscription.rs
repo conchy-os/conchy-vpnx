@@ -89,13 +89,19 @@ async fn fetch(url: &str, device: &Device) -> Result<(String, Meta)> {
     for (name, value) in device.headers() {
         req = req.header(name, value);
     }
-    let resp = req.send().await.context("downloading subscription")?;
+    // The URL carries the account's token: keep it out of errors and logs.
+    let resp = req
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("downloading subscription")?;
     let status = resp.status();
     if !status.is_success() {
         bail!("subscription server answered {status}");
     }
     let meta = meta_from_headers(resp.headers());
-    Ok((resp.text().await?, meta))
+    let text = resp.text().await.map_err(reqwest::Error::without_url)?;
+    Ok((text, meta))
 }
 
 fn meta_from_headers(headers: &HeaderMap) -> Meta {

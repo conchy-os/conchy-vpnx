@@ -7,6 +7,7 @@ pub mod device;
 pub mod merge;
 pub mod mihomo;
 pub mod mode;
+pub mod overlay;
 pub mod paths;
 pub mod settings;
 pub mod subscription;
