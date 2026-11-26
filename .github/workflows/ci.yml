@@ -1,13 +1,34 @@
 name: CI
-on: [push, pull_request]
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
 jobs:
   check:
+    name: Void glibc (fmt, clippy, test)
     runs-on: ubuntu-latest
+    container: ghcr.io/void-linux/void-glibc-full:latest
     steps:
+      - name: Install toolchain and dependencies
+        shell: sh
+        run: |
+          xbps-install -Suy xbps && xbps-install -uy && xbps-install -y rust cargo git bash zstd && git config --global --add safe.directory '*'
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
         with:
-          components: clippy, rustfmt
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: void-glibc-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            void-glibc-${{ runner.os }}-
+      - name: Check formatting, clippy, and tests
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
